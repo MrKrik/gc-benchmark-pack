@@ -31,13 +31,14 @@ var gcAssociationFailures = 0;
 var pendingSuspend = new Dictionary<int, (double Timestamp, string Reason, int Count)>();
 var pendingPauseStart = new Dictionary<int, (double Timestamp, double SuspendComplete, string Reason, int ExpectedGcCount)>();
 var pendingRestartStart = new Dictionary<int, double>();
-var latestGc = new Dictionary<int, (int Generation, string Reason, string Type, int Count)>();
+var gcByCount = new Dictionary<(int ProcessId, int Count), (int Generation, string Reason, string Type, int Count, double Timestamp)>();
 using var writer = new StreamWriter(output, false);
 using var source = new EventPipeEventSource(input);
 var parser = new ClrTraceEventParser(source);
 parser.GCStart += data =>
 {
-    latestGc[data.ProcessID] = (data.Depth, data.Reason.ToString(), data.Type.ToString(), data.Count);
+    gcByCount[(data.ProcessID, data.Count)] =
+        (data.Depth, data.Reason.ToString(), data.Type.ToString(), data.Count, data.TimeStampRelativeMSec);
     if (!measurementActive) return;
     writer.WriteLine(JsonSerializer.Serialize(new
     {
@@ -90,9 +91,26 @@ parser.GCRestartEEStop += data =>
         return;
     }
 
-    if (!latestGc.TryGetValue(data.ProcessID, out var gc) || gc.Count != pause.ExpectedGcCount + 1)
+    // A GC pause's count may name the active collection or precede its GCStart
+    // by one. Match only starts observed by pause end to avoid choosing a future GC.
+    var hasGc = false;
+    var gc = default((int Generation, string Reason, string Type, int Count, double Timestamp));
+    foreach (var candidateCount in new[] { pause.ExpectedGcCount, pause.ExpectedGcCount + 1 })
+    {
+        if (gcByCount.TryGetValue((data.ProcessID, candidateCount), out var candidate) &&
+            candidate.Timestamp <= data.TimeStampRelativeMSec &&
+            (!hasGc || candidate.Timestamp > gc.Timestamp))
+        {
+            gc = candidate;
+            hasGc = true;
+        }
+    }
+    if (!hasGc)
     {
         gcAssociationFailures++;
+        Console.Error.WriteLine(
+            $"GC pause association failed: process={data.ProcessID}, suspendGcCount={pause.ExpectedGcCount}, " +
+            $"no preceding GCStart found for count {pause.ExpectedGcCount} or {pause.ExpectedGcCount + 1}");
         return;
     }
     writer.WriteLine(JsonSerializer.Serialize(new
