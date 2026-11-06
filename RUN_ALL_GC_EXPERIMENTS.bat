@@ -15,7 +15,7 @@ if not defined RUNS set "RUNS=10"
 if not defined ITEMS set "ITEMS=10000"
 if not defined BATCHES set "BATCHES=1000"
 if not defined PAYLOAD set "PAYLOAD=128"
-if not defined WARMUP_BATCHES set "WARMUP_BATCHES=10"
+if not defined WARMUP_BATCHES set "WARMUP_BATCHES=50"
 
 if not exist "%ROOT%tools\run_all_scenarios.bat" (
   echo ERROR: Run this file from the extracted project folder.

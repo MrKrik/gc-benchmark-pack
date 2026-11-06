@@ -38,7 +38,7 @@ $outFile = Join-Path $resultsDir ("{0}-{1}.jsonl" -f $Platform, $Scenario)
 $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 [System.IO.File]::WriteAllText($outFile, '', $utf8NoBom)
 
-$warmup = 10
+$warmup = 50
 if (-not [string]::IsNullOrWhiteSpace($env:WARMUP_BATCHES)) {
     try {
         $warmup = [int]$env:WARMUP_BATCHES

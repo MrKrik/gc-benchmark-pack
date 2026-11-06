@@ -17,9 +17,9 @@ METRICS = [
     ("batch_latency_ms.p99", "p99 задержки партии", "ms"),
 ]
 DIAGNOSTIC_METRICS = [
-    ("gc_cycles", "Циклы GC (счётчик runtime)", "cycles", {
-        "go": "metrics.gc_cycles_delta", "java": "metrics.gc_collections_delta",
-    }, "Числа циклов GC; состав событий зависит от runtime."),
+    ("go_gc_cycles", "Go: полные циклы GC (NumGC)", "cycles", {
+        "go": "metrics.gc_cycles_delta",
+    }, "Счётчик Go NumGC; не сравнивать с поколенческими .NET и MXBean-счётчиками Java."),
     ("dotnet_gen0", ".NET: сборки Gen 0", "collections", {
         "dotnet": "metrics.gen0_collections_delta",
     }, "Счётчик .NET для поколения 0."),
@@ -29,13 +29,24 @@ DIAGNOSTIC_METRICS = [
     ("dotnet_gen2", ".NET: сборки Gen 2", "collections", {
         "dotnet": "metrics.gen2_collections_delta",
     }, "Счётчик .NET для поколения 2."),
-    ("stw_pause_ms", "Суммарные STW-паузы", "ms", {
+    ("go_stw_pause_ms", "Go: сумма STW-пауз", "ms", {
         "go": "metrics.gc_stw_pause_total_ms_delta",
+    }, "Go runtime-счётчик; семантически не объединять с .NET или Java."),
+    ("dotnet_stw_pause_ms", ".NET: сумма GC-пауз", "ms", {
         "dotnet": "metrics.gc_stw_pause_total_ms_delta",
-    }, "Платформенные определения различаются; не сравнивать Go и .NET как одну шкалу."),
-    ("java_gc_elapsed_ms", "Java: время GC по MXBean (приближённое)", "ms", {
-        "java": "metrics.gc_collection_elapsed_ms_delta_approx",
-    }, "Elapsed-время сборок, не STW-паузы и не CPU-время."),
+    }, "GC.GetTotalPauseDuration; семантически не объединять с Go или Java."),
+    ("go_pause_p50", "Go: p50 паузы GC (оценка гистограммы)", "ms", {
+        "go": "metrics.gc_pause_duration_histogram_ms.p50_approx",
+    }, "Оценка по серединам runtime histogram buckets; дельта охватывает весь интервал, а не только последние 256 циклов."),
+    ("go_pause_p95", "Go: p95 паузы GC (оценка гистограммы)", "ms", {
+        "go": "metrics.gc_pause_duration_histogram_ms.p95_approx",
+    }, "Оценка по серединам runtime histogram buckets; это не точные сырые длительности."),
+    ("dotnet_pause_p50", ".NET: p50 наблюдённых пауз", "ms", {
+        "dotnet": "metrics.gc_pause_durations_ms.p50",
+    }, "PauseDurations считываются после батчей; несколько сборок внутри одного батча могут быть пропущены."),
+    ("dotnet_pause_p95", ".NET: p95 наблюдённых пауз", "ms", {
+        "dotnet": "metrics.gc_pause_durations_ms.p95",
+    }, "PauseDurations считываются после батчей; несколько сборок внутри одного батча могут быть пропущены."),
     ("go_gc_cpu_seconds", "Go: оценка CPU-времени GC", "s", {
         "go": "metrics.gc_cpu_seconds_estimated_delta",
     }, "Оценка runtime, не эквивалент CPU-счётчика других платформ."),
@@ -48,7 +59,7 @@ DIAGNOSTIC_METRICS = [
         "go": "allocated_bytes_per_second",
         "dotnet": "allocated_bytes_per_second",
         "java": "allocated_bytes_per_second",
-    }, "Охват счётчиков различается: Go/.NET процесс, Java — поток теста. Не сравнивать напрямую."),
+    }, "Охват: Go/.NET — процесс; Java — только поток теста, без JVM-служебных потоков. Метрика runtime-specific; не сравнивать напрямую."),
 ]
 DIAGNOSTIC_VALUE_PATHS = {
     name: paths for name, _, _, paths, _ in DIAGNOSTIC_METRICS
@@ -495,6 +506,58 @@ def main():
                 f'<p>{html.escape(note)}</p><img src="{html.escape(chart_name)}" alt="{html.escape(title)}"></section>'
             )
 
+    java_collector_columns = sorted({
+        key for row in rows for key in row
+        if key.startswith("gc_collectors_delta.")
+        and (key.endswith(".count_delta") or key.endswith(".elapsed_ms_delta"))
+    })
+    for column in java_collector_columns:
+        java_rows = [row for row in rows if row.get("platform") == "java"]
+        stats = summarize(java_rows, column)
+        collector_metric = column.removeprefix("gc_collectors_delta.")
+        collector, _, metric_kind = collector_metric.rpartition(".")
+        is_elapsed = metric_kind == "elapsed_ms_delta"
+        title = (
+            f"Java: elapsed MXBean коллектора {collector}"
+            if is_elapsed else f"Java: число коллекций MXBean {collector}"
+        )
+        unit = "ms (approx)" if is_elapsed else "collections"
+        note = (
+            "Приблизительное elapsed-время этого коллектора, не STW и не CPU-время; "
+            "значения разных коллекторов не суммируются."
+            if is_elapsed else
+            "Отдельный счётчик MXBean; разные коллекторы не суммируются в общее число циклов."
+        )
+        for platform, item in stats.items():
+            diagnostic_rows.append({
+                "Платформа": platform,
+                "Показатель": title,
+                "Повторов": item["runs"],
+                "Медиана": f"{item['median']:.4f}",
+                "Q1": f"{item['q1']:.4f}",
+                "Q3": f"{item['q3']:.4f}",
+                "95% ДИ медианы": (
+                    f"[{item['median_ci95'][0]:.4f}, {item['median_ci95'][1]:.4f}]"
+                    if item["median_ci95"] else "недостаточно повторов (нужно ≥6)"
+                ),
+                "Единица": unit,
+                "Ограничение": note,
+            })
+            chart_name = "gc_java_collector_" + "".join(
+                character if character.isalnum() else "_" for character in collector
+            ) + ".svg"
+            bar_chart(
+                java_rows,
+                column,
+                f"{title}: медиана и IQR",
+                unit,
+                output / chart_name,
+            )
+            diagnostic_charts.append(
+                f'<section><h3>{html.escape(title)}</h3>'
+                f'<p>{html.escape(note)}</p><img src="{html.escape(chart_name)}" alt="{html.escape(title)}"></section>'
+            )
+
     diagnostic_path = output / "gc-diagnostics.csv"
     if diagnostic_rows:
         with diagnostic_path.open("w", encoding="utf-8-sig", newline="") as f:
@@ -560,7 +623,7 @@ section{{background:white;border-radius:12px;margin:16px 0;padding:16px;box-shad
 <section><h2>Разброс повторений: {html.escape(throughput_title.lower())}</h2><img src="{html.escape(throughput_column.replace('.', '_') + '_runs.svg')}" alt="Повторения: {html.escape(throughput_title.lower())}"></section>
 {jfr_section}
 <section><h2>Сводная таблица</h2><div class="table-wrap"><table><thead><tr>{headers}</tr></thead><tbody>{table_rows}</tbody></table></div></section>
-<section><h2>Диагностика GC по платформам</h2><p>Графики этой секции показывают каждую платформу отдельно. Семантика счётчиков и пауз зависит от runtime; не используйте их как прямой межплатформенный рейтинг.</p><div class="table-wrap"><table><thead><tr>{diagnostic_headers}</tr></thead><tbody>{diagnostic_table_rows}</tbody></table></div>{''.join(diagnostic_charts)}</section>
+<section><h2>Диагностика GC по платформам</h2><p>Счётчики поколений .NET, циклов Go и отдельные MXBean-коллекторы Java показаны раздельно и не являются общей межплатформенной шкалой. Паузы Go/.NET и JFR Java также получены разными способами и не сравниваются как эквивалентные распределения. Скорость аллокаций у Go/.NET процессная, у Java — только поток теста.</p><div class="table-wrap"><table><thead><tr>{diagnostic_headers}</tr></thead><tbody>{diagnostic_table_rows}</tbody></table></div>{''.join(diagnostic_charts)}</section>
 <section><h2>Все результаты</h2><div class="table-wrap full-table"><table><thead><tr>{raw_headers}</tr></thead><tbody>{raw_table_rows}</tbody></table></div></section>
 <footer>Источник: {html.escape(str(source))}. Session ID: {html.escape(', '.join(sorted(session_ids)) if session_ids else 'не указан')}. Столбцы показывают медиану, усы — Q1–Q3 (PERCENTILE.INC). 95% ДИ медианы — точный консервативный непараметрический интервал по порядковым статистикам независимых процессных повторов; он показывается только при n ≥ 6. Он описывает вариацию запусков внутри одной сессии, но не межсессионный дрейф; для публикационных выводов повторите полный эксперимент отдельными сессиями. Интервалы пауз JFR не заменяют независимые запуски бенчмарка.</footer>
 </main></body></html>"""

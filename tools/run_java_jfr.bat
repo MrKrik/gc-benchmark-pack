@@ -16,7 +16,7 @@ if not defined RUNS set "RUNS=10"
 if not defined ITEMS set "ITEMS=10000"
 if not defined BATCHES set "BATCHES=1000"
 if not defined PAYLOAD set "PAYLOAD=128"
-if not defined WARMUP_BATCHES set "WARMUP_BATCHES=10"
+if not defined WARMUP_BATCHES set "WARMUP_BATCHES=50"
 if not defined GC_BENCH_EXPECTED_REPETITIONS set "GC_BENCH_EXPECTED_REPETITIONS=%RUNS%"
 
 if /I not "%SCENARIO%"=="transient" if /I not "%SCENARIO%"=="retained" if /I not "%SCENARIO%"=="graph" if /I not "%SCENARIO%"=="large" if /I not "%SCENARIO%"=="mixed" (

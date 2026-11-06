@@ -9,7 +9,8 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.nio.file.Path;
-import jdk.jfr.Configuration;
+import java.time.Duration;
+import com.sun.management.HotSpotDiagnosticMXBean;
 import jdk.jfr.Recording;
 
 public final class GcBench {
@@ -60,8 +61,12 @@ public final class GcBench {
     static void touch(Node[] nodes) {
         for (Node n : nodes) {
             checksum += n.id + n.payload.length;
-            if (n.payload.length > 0) checksum += Byte.toUnsignedInt(n.payload[0]);
+            if (n.payload.length > 0) {
+                checksum += Byte.toUnsignedInt(n.payload[0]);
+                checksum += Byte.toUnsignedInt(n.payload[n.payload.length - 1]);
+            }
             if (n.left != null) checksum += n.left.id;
+            if (n.right != null) checksum += n.right.id;
         }
     }
 
@@ -80,17 +85,55 @@ public final class GcBench {
     }
 
     static final class GcSnapshot {
-        long count;
-        long elapsedMs;
         final Map<String, long[]> byCollector = new LinkedHashMap<>();
         GcSnapshot() {
             for (GarbageCollectorMXBean bean : ManagementFactory.getGarbageCollectorMXBeans()) {
                 long c = bean.getCollectionCount();
                 long t = bean.getCollectionTime();
                 byCollector.put(bean.getName(), new long[]{c, t});
-                if (c >= 0) count += c;
-                if (t >= 0) elapsedMs += t;
             }
+        }
+    }
+
+    static Map<String, Long> gcCollectionCounts() {
+        Map<String, Long> counts = new LinkedHashMap<>();
+        for (GarbageCollectorMXBean bean : ManagementFactory.getGarbageCollectorMXBeans()) {
+            counts.put(bean.getName(), bean.getCollectionCount());
+        }
+        return counts;
+    }
+
+    static boolean hasCompletedCollection(Map<String, Long> previousCounts) {
+        for (GarbageCollectorMXBean bean : ManagementFactory.getGarbageCollectorMXBeans()) {
+            long previous = previousCounts.getOrDefault(bean.getName(), -1L);
+            long current = bean.getCollectionCount();
+            if (previous >= 0 && current > previous) return true;
+        }
+        return false;
+    }
+
+    static void ensureExplicitGcEnabled() {
+        HotSpotDiagnosticMXBean diagnostic = ManagementFactory.getPlatformMXBean(HotSpotDiagnosticMXBean.class);
+        if (diagnostic != null && Boolean.parseBoolean(diagnostic.getVMOption("DisableExplicitGC").getValue())) {
+            throw new IllegalStateException("Explicit GC is disabled by the JVM; heap snapshots would be invalid");
+        }
+        for (String argument : ManagementFactory.getRuntimeMXBean().getInputArguments()) {
+            if (argument.equalsIgnoreCase("-XX:+DisableExplicitGC")) {
+                throw new IllegalStateException("Explicit GC is disabled by -XX:+DisableExplicitGC; heap snapshots would be invalid");
+            }
+        }
+    }
+
+    static void requestFullGcAndWait() throws InterruptedException {
+        ensureExplicitGcEnabled();
+        Map<String, Long> previousCounts = gcCollectionCounts();
+        System.gc();
+        long deadline = System.nanoTime() + Duration.ofSeconds(60).toNanos();
+        while (!hasCompletedCollection(previousCounts)) {
+            if (System.nanoTime() >= deadline) {
+                throw new IllegalStateException("No completed GC was observed after System.gc(); refusing to report a full-GC heap snapshot");
+            }
+            Thread.sleep(10);
         }
     }
 
@@ -127,7 +170,7 @@ public final class GcBench {
 
     public static void main(String[] args) {
         String scenario = "transient";
-        int batches = 1000, warmupBatches = 10, items = 10000, payload = 128;
+        int batches = 1000, warmupBatches = 50, items = 10000, payload = 128;
         String jfrFile = null;
         try {
             for (int i = 0; i < args.length; i++) {
@@ -146,6 +189,7 @@ public final class GcBench {
             }
             if (batches < 1 || warmupBatches < 0 || items < 1 || payload < 0) throw new IllegalArgumentException("batches/items must be positive and payload non-negative");
             if (!List.of("transient", "retained", "graph", "large", "mixed").contains(scenario)) throw new IllegalArgumentException("Unknown scenario: " + scenario);
+            ensureExplicitGcEnabled();
 
             retained.clear(); sinkNodes = null; sinkBytes = null;
             int warmItems = items;
@@ -162,14 +206,14 @@ public final class GcBench {
             }
             retained.clear(); sinkNodes = null; sinkBytes = null;
             // Explicit full-GC request is part of the unmeasured warm-up/reset phase.
-            System.gc();
-            Thread.sleep(100);
+            requestFullGcAndWait();
             int retainedPerBatch = Math.max(1, items / 10);
             if (scenario.equals("retained") || scenario.equals("mixed"))
                 retained.ensureCapacity(Math.multiplyExact(retainedPerBatch, batches));
             Recording recording = null;
             if (jfrFile != null && !jfrFile.isBlank()) {
-                recording = new Recording(Configuration.getConfiguration("profile"));
+                recording = new Recording();
+                recording.enable("jdk.GCPhasePause").withThreshold(Duration.ZERO).withoutStackTrace();
                 recording.setName("GC benchmark measured interval");
                 recording.setToDisk(true);
                 recording.setDestination(Path.of(jfrFile));
@@ -237,11 +281,8 @@ public final class GcBench {
             if (recording != null) { recording.stop(); recording.close(); }
             long allocAfter = allocatedBytes();
             GcSnapshot gcAfter = new GcSnapshot();
-            long countDelta = gcAfter.count - gcBefore.count;
-            long elapsedGcDelta = gcAfter.elapsedMs - gcBefore.elapsedMs;
             long allocDelta = (allocBefore < 0 || allocAfter < 0) ? -1 : allocAfter - allocBefore;
-            System.gc();
-            Thread.sleep(100);
+            requestFullGcAndWait();
             long heapAfterFullGc = heapUsed();
             long committedAfterFullGc = heapCommitted();
             // Keep the long-lived graph reachable through the post-measurement full GC.
@@ -253,12 +294,12 @@ public final class GcBench {
                 "\"os\":\"" + jsonEscape(System.getProperty("os.name") + " " + System.getProperty("os.version")) + "\",\"architecture\":\"" + jsonEscape(System.getProperty("os.arch")) + "\"," +
                 "\"scenario\":\"" + scenario + "\",\"batches\":" + batches + ",\"warmup_batches\":" + warmupBatches + ",\"measurement_start_uptime_ms\":" + measurementStartUptimeMs + ",\"items\":" + items + ",\"payload_bytes\":" + payload + "," +
                 "\"objects_created_nodes\":" + nodesCreated + ",\"retained_nodes_after\":" + retained.size() + ",\"large_buffers_created\":" + largeBuffers + ",\"payload_bytes_requested\":" + payloadRequested + ",\"elapsed_ms\":" + elapsedMs + "," +
-                "\"logical_nodes_per_second\":" + (nodesCreated / (elapsedMs / 1000.0)) + ",\"payload_bytes_per_second\":" + (payloadRequested / (elapsedMs / 1000.0)) + ",\"allocated_bytes_per_second\":" + (allocDelta < 0 ? "null" : Double.toString(allocDelta / (elapsedMs / 1000.0))) + "," +
+                "\"logical_nodes_per_second\":" + (nodesCreated / (elapsedMs / 1000.0)) + ",\"payload_bytes_per_second\":" + (payloadRequested / (elapsedMs / 1000.0)) + ",\"allocated_bytes_per_second\":" + (allocDelta < 0 ? "null" : Double.toString(allocDelta / (elapsedMs / 1000.0))) + ",\"allocated_bytes_scope\":\"benchmark_thread\"," +
                 "\"batch_latency_ms\":{\"p50\":" + nullableNumber(percentile(batchTimes,.50)) + ",\"p95\":" + nullableNumber(percentile(batchTimes,.95)) + ",\"p99\":" + nullableNumber(percentile(batchTimes,.99)) + ",\"samples\":" + batchTimes.size() + "}," +
                 "\"metrics\":{\"allocated_bytes_delta_main_thread\":" + (allocDelta < 0 ? "null" : Long.toString(allocDelta)) + ",\"heap_used_bytes_before\":" + heapBefore + ",\"heap_used_bytes_after_full_gc\":" + heapAfterFullGc + ",\"heap_committed_bytes_after_full_gc\":" + committedAfterFullGc + "," +
-                "\"gc_collections_delta\":" + countDelta + ",\"gc_collection_elapsed_ms_delta_approx\":" + elapsedGcDelta + ",\"gc_stw_pause_total_ms\":null}," +
+                "\"gc_stw_pause_total_ms\":null}," +
                 "\"gc_collectors_delta\":" + collectorJson(gcBefore, gcAfter) + ",\"jfr_file\":" + (jfrFile == null ? "null" : "\"" + jsonEscape(jfrFile) + "\"") + ",\"jvm_input_arguments\":\"" + jsonEscape(inputArgs) + "\",\"checksum\":" + checksum + "," +
-                "\"note\":\"Thread allocation counter covers the benchmark thread only. MXBean collection time is approximate elapsed collection time, not stop-the-world pause time. Warm-up and System.gc() cleanup are excluded from measured deltas; explicit GC must not be disabled. When --jfr-file is supplied, the JFR recording covers only the measured interval; use jfr print --events jdk.GCPhasePause <file> for pause distribution.\"}";
+                "\"note\":\"Java allocation counter covers the benchmark thread only, not JVM service threads. MXBean collection counts and elapsed times are reported separately per collector; elapsed time is approximate and is not stop-the-world pause time. Warm-up and verified System.gc() cleanup are excluded from measured deltas. When --jfr-file is supplied, only jdk.GCPhasePause is recorded for the measured interval.\"}";
             System.out.println(json);
         } catch (Exception ex) {
             System.err.println(ex.getMessage());

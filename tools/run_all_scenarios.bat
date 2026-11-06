@@ -13,7 +13,7 @@ if not defined RUNS set "RUNS=10"
 if not defined ITEMS set "ITEMS=10000"
 if not defined BATCHES set "BATCHES=1000"
 if not defined PAYLOAD set "PAYLOAD=128"
-if not defined WARMUP_BATCHES set "WARMUP_BATCHES=10"
+if not defined WARMUP_BATCHES set "WARMUP_BATCHES=50"
 
 for /f "delims=0123456789" %%A in ("%RUNS%") do goto :invalid_parameters
 for /f "delims=0123456789" %%A in ("%ITEMS%") do goto :invalid_parameters

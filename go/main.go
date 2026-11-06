@@ -49,9 +49,13 @@ func touchNodes(nodes []*Node) {
 			checksum += uint64(n.ID) + uint64(len(n.Payload))
 			if len(n.Payload) > 0 {
 				checksum += uint64(n.Payload[0])
+				checksum += uint64(n.Payload[len(n.Payload)-1])
 			}
 			if n.Left != nil {
 				checksum += uint64(n.Left.ID)
+			}
+			if n.Right != nil {
+				checksum += uint64(n.Right.ID)
 			}
 		}
 	}
@@ -71,20 +75,66 @@ func percentile(values []float64, p float64) *float64 {
 	return &x
 }
 
-func pauseSamples(after runtime.MemStats, delta uint32) []float64 {
-	count := delta
-	if count > 256 {
-		count = 256
+type pauseHistogram struct {
+	buckets []float64
+	counts  []uint64
+}
+
+func readPauseHistogram() (pauseHistogram, error) {
+	sample := []metrics.Sample{{Name: "/gc/pauses:seconds"}}
+	metrics.Read(sample)
+	if sample[0].Value.Kind() != metrics.KindFloat64Histogram {
+		return pauseHistogram{}, fmt.Errorf("/gc/pauses:seconds has unexpected value kind %v", sample[0].Value.Kind())
 	}
-	out := make([]float64, 0, count)
-	for i := uint32(0); i < count; i++ {
-		idx := (after.NumGC + 255 - i) % 256
-		ns := after.PauseNs[idx]
-		if ns > 0 {
-			out = append(out, float64(ns)/1e6)
+	histogram := sample[0].Value.Float64Histogram()
+	if histogram == nil {
+		return pauseHistogram{}, fmt.Errorf("/gc/pauses:seconds returned an empty histogram")
+	}
+	return pauseHistogram{
+		buckets: append([]float64(nil), histogram.Buckets...),
+		counts:  append([]uint64(nil), histogram.Counts...),
+	}, nil
+}
+
+func pauseHistogramDelta(before, after pauseHistogram) ([]float64, []map[string]any, error) {
+	if len(before.counts) != len(after.counts) || len(after.buckets) != len(after.counts)+1 {
+		return nil, nil, fmt.Errorf("incompatible /gc/pauses:seconds histogram snapshots")
+	}
+	var values []float64
+	buckets := make([]map[string]any, 0, len(after.counts))
+	for i, count := range after.counts {
+		if count < before.counts[i] {
+			return nil, nil, fmt.Errorf("/gc/pauses:seconds histogram counter decreased at bucket %d", i)
+		}
+		delta := count - before.counts[i]
+		if delta == 0 {
+			continue
+		}
+		lower, upper := after.buckets[i], after.buckets[i+1]
+		var lowerBound, upperBound any = lower, upper
+		if lower < -1e300 {
+			lowerBound = nil
+		}
+		if upper > 1e300 {
+			upperBound = nil
+		}
+		buckets = append(buckets, map[string]any{
+			"lower_bound_seconds": lowerBound,
+			"upper_bound_seconds": upperBound,
+			"count":               delta,
+		})
+		estimate := upper
+		switch {
+		case lower >= 0 && upper >= 0 && upper < 1e300:
+			estimate = lower + (upper-lower)/2
+		case lower > 0 && upper >= 1e300:
+			estimate = lower
+		}
+		for n := uint64(0); n < delta; n++ {
+			values = append(values, estimate*1000)
 		}
 	}
-	return out
+	return values, buckets, nil
 }
 
 func readGCCPUSeconds() float64 {
@@ -99,7 +149,7 @@ func readGCCPUSeconds() float64 {
 func main() {
 	scenario := flag.String("scenario", "transient", "transient|retained|graph|large|mixed")
 	batches := flag.Int("batches", 1000, "number of measured batches")
-	warmupBatches := flag.Int("warmup-batches", 10, "unmeasured warm-up batches")
+	warmupBatches := flag.Int("warmup-batches", 50, "unmeasured warm-up batches")
 	items := flag.Int("items", 10000, "items per batch or retained-set size")
 	payload := flag.Int("payload", 128, "payload bytes per node; for large scenario, bytes per array")
 	flag.Parse()
@@ -154,6 +204,11 @@ func main() {
 	}
 	gcCPUBefore := readGCCPUSeconds()
 	runtime.ReadMemStats(&before)
+	pauseHistogramBefore, err := readPauseHistogram()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "read GC pause histogram before measurement:", err)
+		os.Exit(2)
+	}
 	batchTimes := make([]float64, 0, *batches)
 	var nodesCreated, largeBuffers uint64
 	var payloadRequested uint64
@@ -248,13 +303,22 @@ func main() {
 	elapsedSeconds := float64(end-start) / float64(batchFrequency)
 	runtime.ReadMemStats(&after)
 	gcCPUAfter := readGCCPUSeconds()
+	pauseHistogramAfter, err := readPauseHistogram()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "read GC pause histogram after measurement:", err)
+		os.Exit(2)
+	}
 	runtime.KeepAlive(retainedNodes)
 	runtime.GC()
 	var afterFullGC runtime.MemStats
 	runtime.ReadMemStats(&afterFullGC)
 	pauseDelta := after.PauseTotalNs - before.PauseTotalNs
 	gcDelta := after.NumGC - before.NumGC
-	pauses := pauseSamples(after, gcDelta)
+	pauses, pauseBuckets, err := pauseHistogramDelta(pauseHistogramBefore, pauseHistogramAfter)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "calculate GC pause histogram delta:", err)
+		os.Exit(2)
+	}
 	logicalNodesPerSecond := float64(nodesCreated) / elapsedSeconds
 	payloadBytesPerSecond := float64(payloadRequested) / elapsedSeconds
 	allocatedBytesPerSecond := float64(after.TotalAlloc-before.TotalAlloc) / elapsedSeconds
@@ -271,6 +335,7 @@ func main() {
 		"logical_nodes_per_second":   logicalNodesPerSecond,
 		"payload_bytes_per_second":   payloadBytesPerSecond,
 		"allocated_bytes_per_second": allocatedBytesPerSecond,
+		"allocated_bytes_scope":      "process",
 		"batch_latency_ms":           map[string]any{"p50": p50, "p95": p95, "p99": p99, "samples": len(batchTimes), "timer": batchTimerName},
 		"metrics": map[string]any{
 			"allocated_bytes_delta":  after.TotalAlloc - before.TotalAlloc,
@@ -279,12 +344,15 @@ func main() {
 			"heap_live_bytes_after_full_gc": afterFullGC.HeapAlloc, "heap_objects_after_full_gc": afterFullGC.HeapObjects,
 			"sys_bytes_after": after.Sys, "heap_released_bytes_after": after.HeapReleased,
 			"gc_cycles_delta": gcDelta, "gc_stw_pause_total_ms_delta": float64(pauseDelta) / 1e6,
-			"recent_gc_pause_ms":                 map[string]any{"p50": percentile(pauses, .50), "p95": percentile(pauses, .95), "max": maxFloat(pauses), "samples": len(pauses)},
+			"gc_pause_duration_histogram_ms": map[string]any{
+				"p50_approx": percentile(pauses, .50), "p95_approx": percentile(pauses, .95),
+				"max_approx": maxFloat(pauses), "samples": len(pauses), "buckets": pauseBuckets,
+			},
 			"gc_cpu_fraction_process_cumulative": after.GCCPUFraction,
 			"gc_cpu_seconds_estimated_delta":     gcCPUAfter - gcCPUBefore,
 		},
 		"checksum": checksum,
-		"note":     "Go GC CPU-seconds is an estimated runtime metric; GCCPUFraction is process-cumulative; recent pause samples cover at most the last 256 GC cycles.",
+		"note":     "Go GC CPU-seconds is an estimated runtime metric; GCCPUFraction is process-cumulative. GC pause percentiles are approximated from /gc/pauses:seconds histogram bucket deltas for the full measurement interval.",
 	}
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetEscapeHTML(false)

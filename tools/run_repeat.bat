@@ -18,7 +18,7 @@ if not defined RUNS set "RUNS=10"
 if not defined ITEMS set "ITEMS=10000"
 if not defined BATCHES set "BATCHES=1000"
 if not defined PAYLOAD set "PAYLOAD=128"
-if not defined WARMUP_BATCHES set "WARMUP_BATCHES=10"
+if not defined WARMUP_BATCHES set "WARMUP_BATCHES=50"
 if not defined GC_BENCH_EXPECTED_REPETITIONS set "GC_BENCH_EXPECTED_REPETITIONS=%RUNS%"
 
 if /I not "%PLATFORM%"=="go" if /I not "%PLATFORM%"=="dotnet" if /I not "%PLATFORM%"=="java" (
@@ -206,7 +206,7 @@ exit /b 1
  echo   %~nx0 go transient 10 10000 1000 128
  echo.
  echo Optional environment variables:
- echo   WARMUP_BATCHES=10
+ echo   WARMUP_BATCHES=50
  echo   JAVA_OPTS="-Xms512m -Xmx512m -XX:+UseG1GC"
 :usage_error
 exit /b 2

@@ -2,16 +2,16 @@
 set -euo pipefail
 
 if [[ $# -lt 2 ]]; then
-  echo "Usage: $0 <go|dotnet|java> <scenario> [runs=10] [items=10000] [batches=100] [payload=128]" >&2
+  echo "Usage: $0 <go|dotnet|java> <scenario> [runs=10] [items=10000] [batches=1000] [payload=128]" >&2
   exit 2
 fi
 platform="$1"
 scenario="$2"
 runs="${3:-10}"
 items="${4:-10000}"
-batches="${5:-100}"
+batches="${5:-1000}"
 payload="${6:-128}"
-warmup="${WARMUP_BATCHES:-10}"
+warmup="${WARMUP_BATCHES:-50}"
 root="$(cd "$(dirname "$0")/.." && pwd)"
 mkdir -p "$root/results"
 out="$root/results/${platform}-${scenario}.jsonl"
