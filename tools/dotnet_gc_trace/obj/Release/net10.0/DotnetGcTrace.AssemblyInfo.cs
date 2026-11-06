@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("DotnetGcTrace")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Release")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+f8d2ac3c54fe56724593f305528916c17b0edd8d")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+2c243849a63ff36f93a81fb3ff316ec2e9ff58ff")]
 [assembly: System.Reflection.AssemblyProductAttribute("DotnetGcTrace")]
 [assembly: System.Reflection.AssemblyTitleAttribute("DotnetGcTrace")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

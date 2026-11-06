@@ -76,13 +76,11 @@ parser.GCSuspendEEStart += data =>
 };
 parser.GCSuspendEEStop += data =>
 {
-    if (!measurementActive) return;
     if (!pendingSuspend.Remove(data.ProcessID, out var suspend)) return;
     pendingPauseStart[data.ProcessID] = (suspend.Timestamp, data.TimeStampRelativeMSec, suspend.Reason, suspend.Count);
 };
 parser.GCRestartEEStart += data =>
 {
-    if (!measurementActive) return;
     if (!pendingPauseStart.ContainsKey(data.ProcessID))
     {
         if (pendingSuspend.Remove(data.ProcessID)) unmatchedResumeCount++;
@@ -92,7 +90,6 @@ parser.GCRestartEEStart += data =>
 };
 parser.GCRestartEEStop += data =>
 {
-    if (!measurementActive) return;
     if (!pendingPauseStart.Remove(data.ProcessID, out var pause))
     {
         if (pendingSuspend.Remove(data.ProcessID)) unmatchedResumeCount++;
