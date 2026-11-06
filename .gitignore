@@ -1,0 +1,12 @@
+# Build outputs
+/go/gcbench
+/go/gcbench.exe
+/java/*.class
+/dotnet/**/bin/
+/dotnet/**/obj/
+/results/
+*.jfr
+*.nettrace
+*.log
+*.jsonl
+*.csv
