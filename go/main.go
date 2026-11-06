@@ -81,14 +81,14 @@ type pauseHistogram struct {
 }
 
 func readPauseHistogram() (pauseHistogram, error) {
-	sample := []metrics.Sample{{Name: "/gc/pauses:seconds"}}
+	sample := []metrics.Sample{{Name: "/sched/pauses/total/gc:seconds"}}
 	metrics.Read(sample)
 	if sample[0].Value.Kind() != metrics.KindFloat64Histogram {
-		return pauseHistogram{}, fmt.Errorf("/gc/pauses:seconds has unexpected value kind %v", sample[0].Value.Kind())
+		return pauseHistogram{}, fmt.Errorf("/sched/pauses/total/gc:seconds has unexpected value kind %v", sample[0].Value.Kind())
 	}
 	histogram := sample[0].Value.Float64Histogram()
 	if histogram == nil {
-		return pauseHistogram{}, fmt.Errorf("/gc/pauses:seconds returned an empty histogram")
+		return pauseHistogram{}, fmt.Errorf("/sched/pauses/total/gc:seconds returned an empty histogram")
 	}
 	return pauseHistogram{
 		buckets: append([]float64(nil), histogram.Buckets...),
@@ -98,13 +98,13 @@ func readPauseHistogram() (pauseHistogram, error) {
 
 func pauseHistogramDelta(before, after pauseHistogram) ([]float64, []map[string]any, error) {
 	if len(before.counts) != len(after.counts) || len(after.buckets) != len(after.counts)+1 {
-		return nil, nil, fmt.Errorf("incompatible /gc/pauses:seconds histogram snapshots")
+		return nil, nil, fmt.Errorf("incompatible /sched/pauses/total/gc:seconds histogram snapshots")
 	}
 	var values []float64
 	buckets := make([]map[string]any, 0, len(after.counts))
 	for i, count := range after.counts {
 		if count < before.counts[i] {
-			return nil, nil, fmt.Errorf("/gc/pauses:seconds histogram counter decreased at bucket %d", i)
+			return nil, nil, fmt.Errorf("/sched/pauses/total/gc:seconds histogram counter decreased at bucket %d", i)
 		}
 		delta := count - before.counts[i]
 		if delta == 0 {
@@ -325,6 +325,13 @@ func main() {
 
 	p50, p95, p99 := percentile(batchTimes, .50), percentile(batchTimes, .95), percentile(batchTimes, .99)
 	out := map[string]any{
+		"schema_version": 2,
+		"metric_definitions": map[string]any{
+			"allocated_bytes_delta": map[string]any{"unit": "bytes", "source": "runtime.MemStats.TotalAlloc", "scope": "go_runtime_process", "calculation": "TotalAlloc_after - TotalAlloc_before", "cross_platform_comparable": false},
+			"allocated_bytes_per_second": map[string]any{"unit": "bytes/s", "source": "runtime.MemStats.TotalAlloc", "scope": "go_runtime_process", "calculation": "allocated_bytes_delta / elapsed_seconds", "cross_platform_comparable": false},
+			"gc_cycles_delta":       map[string]any{"unit": "cycles", "source": "runtime.MemStats.NumGC", "scope": "measured_interval", "calculation": "NumGC_after - NumGC_before; complete Go GC cycles", "cross_platform_comparable": false},
+			"gc_pause_percentiles":  map[string]any{"unit": "ms", "source": "/sched/pauses/total/gc:seconds", "scope": "measured_interval", "calculation": "approximate quantiles from histogram bucket deltas", "cross_platform_comparable": false},
+		},
 		"platform": "go", "runtime_version": runtime.Version(), "goos": runtime.GOOS, "goarch": runtime.GOARCH,
 		"session_id": os.Getenv("GC_BENCH_SESSION_ID"), "repetition": os.Getenv("GC_BENCH_REPETITION"),
 		"run_order":            os.Getenv("GC_BENCH_RUN_ORDER"),
@@ -335,7 +342,7 @@ func main() {
 		"logical_nodes_per_second":   logicalNodesPerSecond,
 		"payload_bytes_per_second":   payloadBytesPerSecond,
 		"allocated_bytes_per_second": allocatedBytesPerSecond,
-		"allocated_bytes_scope":      "process",
+		"allocated_bytes_scope":      "go_runtime_process",
 		"batch_latency_ms":           map[string]any{"p50": p50, "p95": p95, "p99": p99, "samples": len(batchTimes), "timer": batchTimerName},
 		"metrics": map[string]any{
 			"allocated_bytes_delta":  after.TotalAlloc - before.TotalAlloc,
@@ -345,14 +352,14 @@ func main() {
 			"sys_bytes_after": after.Sys, "heap_released_bytes_after": after.HeapReleased,
 			"gc_cycles_delta": gcDelta, "gc_stw_pause_total_ms_delta": float64(pauseDelta) / 1e6,
 			"gc_pause_duration_histogram_ms": map[string]any{
-				"p50_approx": percentile(pauses, .50), "p95_approx": percentile(pauses, .95),
+				"p50_approx": percentile(pauses, .50), "p95_approx": percentile(pauses, .95), "p99_approx": percentile(pauses, .99),
 				"max_approx": maxFloat(pauses), "samples": len(pauses), "buckets": pauseBuckets,
 			},
 			"gc_cpu_fraction_process_cumulative": after.GCCPUFraction,
 			"gc_cpu_seconds_estimated_delta":     gcCPUAfter - gcCPUBefore,
 		},
 		"checksum": checksum,
-		"note":     "Go GC CPU-seconds is an estimated runtime metric; GCCPUFraction is process-cumulative. GC pause percentiles are approximated from /gc/pauses:seconds histogram bucket deltas for the full measurement interval.",
+		"note":     "Go GC CPU-seconds is an estimated runtime metric; GCCPUFraction is process-cumulative. GC pause percentiles are approximated from /sched/pauses/total/gc:seconds histogram bucket deltas for the full measurement interval; bucket boundaries do not provide exact per-pause durations.",
 	}
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetEscapeHTML(false)

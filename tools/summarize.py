@@ -7,7 +7,7 @@ from pathlib import Path
 
 
 def flatten(record):
-    row = {k: v for k, v in record.items() if k not in {"metrics", "batch_latency_ms", "gc_collectors_delta"}}
+    row = {k: v for k, v in record.items() if k not in {"metrics", "batch_latency_ms", "gc_collectors_delta", "metric_definitions"}}
     def add_nested(prefix, value):
         if isinstance(value, dict):
             for key, nested in value.items():
@@ -15,7 +15,7 @@ def flatten(record):
         else:
             row[prefix] = value
 
-    for group in ("metrics", "batch_latency_ms"):
+    for group in ("metrics", "batch_latency_ms", "metric_definitions"):
         for key, value in record.get(group, {}).items():
             add_nested(f"{group}.{key}", value)
     for collector, values in record.get("gc_collectors_delta", {}).items():
@@ -31,6 +31,7 @@ def main():
     args = ap.parse_args()
 
     rows = []
+    schema_versions = set()
     for name in args.files:
         path = Path(name)
         with path.open(encoding="utf-8") as f:
@@ -41,11 +42,22 @@ def main():
                     rec = json.loads(line)
                 except json.JSONDecodeError as exc:
                     raise SystemExit(f"{path}:{line_no}: invalid JSON: {exc}")
+                schema_versions.add(str(rec.get("schema_version", 1)))
                 row = flatten(rec)
+                allocation_scope = row.get("allocated_bytes_scope")
+                if allocation_scope:
+                    for metric in ("allocated_bytes_per_second", "metrics.allocated_bytes_delta"):
+                        if metric in row:
+                            row[f"{metric}.{allocation_scope}"] = row.pop(metric)
                 row["source_file"] = str(path)
                 rows.append(row)
     if not rows:
         raise SystemExit("No JSON records found")
+    if len(schema_versions) > 1:
+        raise SystemExit(
+            "Cannot combine different result schema versions: "
+            + ", ".join(sorted(schema_versions))
+        )
 
     columns = []
     for row in rows:

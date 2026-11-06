@@ -41,12 +41,9 @@ DIAGNOSTIC_METRICS = [
     ("go_pause_p95", "Go: p95 паузы GC (оценка гистограммы)", "ms", {
         "go": "metrics.gc_pause_duration_histogram_ms.p95_approx",
     }, "Оценка по серединам runtime histogram buckets; это не точные сырые длительности."),
-    ("dotnet_pause_p50", ".NET: p50 наблюдённых пауз", "ms", {
-        "dotnet": "metrics.gc_pause_durations_ms.p50",
-    }, "PauseDurations считываются после батчей; несколько сборок внутри одного батча могут быть пропущены."),
-    ("dotnet_pause_p95", ".NET: p95 наблюдённых пауз", "ms", {
-        "dotnet": "metrics.gc_pause_durations_ms.p95",
-    }, "PauseDurations считываются после батчей; несколько сборок внутри одного батча могут быть пропущены."),
+    ("go_pause_p99", "Go: p99 паузы GC (оценка гистограммы)", "ms", {
+        "go": "metrics.gc_pause_duration_histogram_ms.p99_approx",
+    }, "Оценка по серединам runtime histogram buckets; это не точные сырые длительности."),
     ("go_gc_cpu_seconds", "Go: оценка CPU-времени GC", "s", {
         "go": "metrics.gc_cpu_seconds_estimated_delta",
     }, "Оценка runtime, не эквивалент CPU-счётчика других платформ."),
@@ -55,11 +52,15 @@ DIAGNOSTIC_METRICS = [
         "dotnet": "metrics.heap_used_bytes_after_full_gc",
         "java": "metrics.heap_used_bytes_after_full_gc",
     }, "Снимок после явного запроса полной GC; не RSS, физическая память или строго эквивалентное представление heap."),
-    ("allocated_bytes_per_second", "Скорость аллокации (runtime-specific)", "bytes/s", {
-        "go": "allocated_bytes_per_second",
-        "dotnet": "allocated_bytes_per_second",
-        "java": "allocated_bytes_per_second",
-    }, "Охват: Go/.NET — процесс; Java — только поток теста, без JVM-служебных потоков. Метрика runtime-specific; не сравнивать напрямую."),
+    ("go_allocated_bytes_per_second", "Go: скорость аллокации процесса", "bytes/s", {
+        "go": "allocated_bytes_per_second.go_runtime_process",
+    }, "Go runtime process-wide TotalAlloc; не сравнивается с .NET или Java."),
+    ("dotnet_allocated_bytes_per_second", ".NET: скорость managed-аллокаций процесса", "bytes/s", {
+        "dotnet": "allocated_bytes_per_second.dotnet_managed_process",
+    }, ".NET managed process-wide counter; не сравнивается с Go или Java."),
+    ("java_allocated_bytes_per_second", "Java: скорость аллокаций всех Java-потоков", "bytes/s", {
+        "java": "allocated_bytes_per_second.all_java_threads_runtime_counter",
+    }, "ThreadMXBean total all-threads counter; сохраняется также счетчик потока теста. Не сравнивается с Go или .NET."),
 ]
 DIAGNOSTIC_VALUE_PATHS = {
     name: paths for name, _, _, paths, _ in DIAGNOSTIC_METRICS
@@ -341,16 +342,71 @@ def jfr_report_section(scenario, analysis_dir):
     )
 
 
+def dotnet_eventpipe_report_section(scenario, analysis_dir):
+    if analysis_dir is None:
+        return ""
+    summary_path = analysis_dir / "run-summary.csv"
+    if not summary_path.is_file():
+        raise FileNotFoundError(f".NET EventPipe summary not found: {summary_path}")
+
+    run_rows = [
+        row for row in load_rows(summary_path)
+        if row.get("run", "").startswith(f"{scenario}-run-")
+    ]
+    if not run_rows:
+        return (
+            '<section><h2>.NET EventPipe — паузы GC</h2>'
+            f'<p>Для сценария {html.escape(scenario)} нет диагностических запусков.</p></section>'
+        )
+
+    columns = [
+        ("run", "Запуск"),
+        ("gc_start_events", "События GCStart"),
+        ("pause_events", "Паузы"),
+        ("pause_p50_ms", "p50, мс"),
+        ("pause_p95_ms", "p95, мс"),
+        ("pause_p99_ms", "p99, мс"),
+        ("pause_max_ms", "Максимум, мс"),
+        ("collections_by_generation", "Поколения"),
+        ("collections_by_type", "Типы сборок"),
+    ]
+    headers = "".join(f"<th>{html.escape(label)}</th>" for _, label in columns)
+    body = "".join(
+        "<tr>" + "".join(
+            f"<td>{html.escape(item.get(key, ''))}</td>"
+            for key, _ in columns
+        ) + "</tr>"
+        for item in run_rows
+    )
+    return (
+        '<section><h2>.NET EventPipe — индивидуальные паузы GC</h2>'
+        f'<p>Отдельные диагностические запуски: {len(run_rows)}. '
+        "Полная длительность измеряется от GCSuspendEEStart до GCRestartEEStop; "
+        "отдельно записана длительность полностью остановленного runtime "
+        "(GCSuspendEEStop → GCRestartEEStart). "
+        "поколение, причина и тип берутся из GCStart. Потери/несопоставленные события "
+        "проверяются до включения данных в отчёт. Эти запуски не входят в таблицы времени выполнения.</p>"
+        f'<div class="table-wrap"><table><thead><tr>{headers}</tr></thead>'
+        f"<tbody>{body}</tbody></table></div>"
+        f'<p>Подробные события: <code>{html.escape(str(analysis_dir))}\\pause-events.csv</code> '
+        f'и <code>{html.escape(str(analysis_dir))}\\gc-start-events.csv</code>.</p></section>'
+    )
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("csv_file")
     ap.add_argument("-o", "--output-dir", default="results/report")
     ap.add_argument("--split-by-scenario", action="store_true", help="Create a separate report directory for each scenario")
     ap.add_argument("--jfr-analysis-dir", type=Path, help="Directory with JFR CSV summaries from jfr_pause_batch.py")
+    ap.add_argument("--dotnet-eventpipe-analysis-dir", type=Path, help="Directory with separate .NET EventPipe GC diagnostics")
     args = ap.parse_args()
 
     source = Path(args.csv_file)
     rows = load_rows(source)
+    schema_versions = {row.get("schema_version") or "1" for row in rows}
+    if len(schema_versions) > 1:
+        raise ValueError(f"CSV contains mixed result schema versions: {', '.join(sorted(schema_versions))}")
     session_ids = {row.get("session_id") for row in rows if row.get("session_id")}
     if len(session_ids) > 1:
         raise ValueError(
@@ -380,6 +436,9 @@ def main():
             ] + (
                 ["--jfr-analysis-dir", str(args.jfr_analysis_dir)]
                 if args.jfr_analysis_dir else []
+            ) + (
+                ["--dotnet-eventpipe-analysis-dir", str(args.dotnet_eventpipe_analysis_dir)]
+                if args.dotnet_eventpipe_analysis_dir else []
             ), check=True)
         links = "".join(
             f'<li><a href="{html.escape(scenario)}/index.html">{html.escape(scenario.title())}</a></li>'
@@ -608,6 +667,10 @@ def main():
         jfr_report_section(scenario, args.jfr_analysis_dir)
         for scenario in scenario_values
     ) if args.jfr_analysis_dir else ""
+    dotnet_eventpipe_section = "".join(
+        dotnet_eventpipe_report_section(scenario, args.dotnet_eventpipe_analysis_dir)
+        for scenario in scenario_values
+    ) if args.dotnet_eventpipe_analysis_dir else ""
     html_text = f"""<!doctype html>
 <html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>GC benchmark report</title><style>
@@ -622,8 +685,9 @@ section{{background:white;border-radius:12px;margin:16px 0;padding:16px;box-shad
 {chart_cards}
 <section><h2>Разброс повторений: {html.escape(throughput_title.lower())}</h2><img src="{html.escape(throughput_column.replace('.', '_') + '_runs.svg')}" alt="Повторения: {html.escape(throughput_title.lower())}"></section>
 {jfr_section}
+{dotnet_eventpipe_section}
 <section><h2>Сводная таблица</h2><div class="table-wrap"><table><thead><tr>{headers}</tr></thead><tbody>{table_rows}</tbody></table></div></section>
-<section><h2>Диагностика GC по платформам</h2><p>Счётчики поколений .NET, циклов Go и отдельные MXBean-коллекторы Java показаны раздельно и не являются общей межплатформенной шкалой. Паузы Go/.NET и JFR Java также получены разными способами и не сравниваются как эквивалентные распределения. Скорость аллокаций у Go/.NET процессная, у Java — только поток теста.</p><div class="table-wrap"><table><thead><tr>{diagnostic_headers}</tr></thead><tbody>{diagnostic_table_rows}</tbody></table></div>{''.join(diagnostic_charts)}</section>
+<section><h2>Диагностика GC по платформам</h2><p>Счётчики поколений .NET, циклов Go и отдельные MXBean-коллекторы Java показаны раздельно и не являются общей межплатформенной шкалой. Паузы Go/.NET и JFR Java также получены разными способами и не сравниваются как эквивалентные распределения. Аллокации показываются отдельно для каждой платформы: области счётчиков различаются.</p><div class="table-wrap"><table><thead><tr>{diagnostic_headers}</tr></thead><tbody>{diagnostic_table_rows}</tbody></table></div>{''.join(diagnostic_charts)}</section>
 <section><h2>Все результаты</h2><div class="table-wrap full-table"><table><thead><tr>{raw_headers}</tr></thead><tbody>{raw_table_rows}</tbody></table></div></section>
 <footer>Источник: {html.escape(str(source))}. Session ID: {html.escape(', '.join(sorted(session_ids)) if session_ids else 'не указан')}. Столбцы показывают медиану, усы — Q1–Q3 (PERCENTILE.INC). 95% ДИ медианы — точный консервативный непараметрический интервал по порядковым статистикам независимых процессных повторов; он показывается только при n ≥ 6. Он описывает вариацию запусков внутри одной сессии, но не межсессионный дрейф; для публикационных выводов повторите полный эксперимент отдельными сессиями. Интервалы пауз JFR не заменяют независимые запуски бенчмарка.</footer>
 </main></body></html>"""

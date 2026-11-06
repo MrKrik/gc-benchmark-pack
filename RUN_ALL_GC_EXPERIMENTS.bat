@@ -32,6 +32,12 @@ if errorlevel 1 (
 )
 where go >nul 2>nul || (echo ERROR: Go not found in PATH.& goto :preflight_failed)
 where dotnet >nul 2>nul || (echo ERROR: .NET SDK not found in PATH.& goto :preflight_failed)
+where dotnet-trace >nul 2>nul
+if errorlevel 1 if not exist "%USERPROFILE%\.dotnet\tools\dotnet-trace.exe" (
+  echo ERROR: dotnet-trace is required for separate .NET GC diagnostics.
+  echo Install it with: dotnet tool install --global dotnet-trace
+  goto :preflight_failed
+)
 dotnet --list-sdks | findstr /R /C:"^10\." >nul
 if errorlevel 1 (
   echo ERROR: .NET 10 SDK is required. Installed SDKs:
@@ -98,7 +104,8 @@ if errorlevel 1 (
  echo Full GC experiment
  echo Result folder: results\%BASE_RESULTS_SUBDIR%
  echo Base matrix: 3 platforms x 5 scenarios x %RUNS% repetitions
- echo Java JFR: 5 scenarios x %RUNS% recordings
+ echo Java JFR diagnostics: 5 scenarios x %RUNS% recordings
+ echo .NET EventPipe diagnostics: 5 scenarios x %RUNS% separate runs
  if /I not "%SKIP_LARGE_OBJECT_SERIES%"=="1" echo Extra large-object matrix: 3 platforms x %RUNS% repetitions
  echo ============================================================
  echo.
@@ -111,14 +118,20 @@ if errorlevel 2 (
 
 rem Stage 1: standard matrix, Go + .NET 10 + Java, all five scenarios.
 echo.
-echo [1/5] Running standard benchmark matrix...
+echo [1/6] Running standard benchmark matrix...
 set "RESULTS_SUBDIR=%BASE_RESULTS_SUBDIR%"
 call "%ROOT%tools\run_all_scenarios.bat" %RUNS% %ITEMS% %BATCHES% %PAYLOAD%
 if errorlevel 1 goto :failed
 
-rem Stage 2: Java JFR recordings with the same baseline workload parameters.
+rem Stage 2: collect .NET GC pause events in separate diagnostic runs.
 echo.
-echo [2/5] Recording Java JFR pauses for all five baseline scenarios...
+echo [2/6] Recording .NET EventPipe GC diagnostics for all five scenarios...
+call "%ROOT%tools\run_dotnet_gc_diagnostic.bat" "%BASE_RESULTS_SUBDIR%" %RUNS% %ITEMS% %BATCHES% %PAYLOAD% %WARMUP_BATCHES%
+if errorlevel 1 goto :failed
+
+rem Stage 3: Java JFR recordings with the same baseline workload parameters.
+echo.
+echo [3/6] Recording Java JFR pauses for all five baseline scenarios...
 for %%S in (transient retained graph large mixed) do (
   echo.
   echo --- Java JFR: %%S ---
@@ -126,27 +139,29 @@ for %%S in (transient retained graph large mixed) do (
   if errorlevel 1 goto :failed
 )
 
-rem Stage 3: export Java STW pause events to CSV.
+rem Stage 4: export Java STW pause events to CSV.
 echo.
-echo [3/5] Processing baseline Java JFR recordings...
+echo [4/6] Processing baseline Java JFR recordings...
 call "%ROOT%tools\process_java_jfr.bat"
 if errorlevel 1 goto :failed
 
 echo.
 echo === Adding Java JFR analysis to scenario reports ===
-python "%ROOT%tools\visualize_results.py" "%ROOT%results\%BASE_RESULTS_SUBDIR%\comparison-all-scenarios.csv" -o "%ROOT%results\%BASE_RESULTS_SUBDIR%\report-all" --split-by-scenario --jfr-analysis-dir "%ROOT%results\%BASE_RESULTS_SUBDIR%\jfr-analysis"
+python "%ROOT%tools\visualize_results.py" "%ROOT%results\%BASE_RESULTS_SUBDIR%\comparison-all-scenarios.csv" -o "%ROOT%results\%BASE_RESULTS_SUBDIR%\report-all" --split-by-scenario --jfr-analysis-dir "%ROOT%results\%BASE_RESULTS_SUBDIR%\jfr-analysis" --dotnet-eventpipe-analysis-dir "%ROOT%results\%BASE_RESULTS_SUBDIR%\dotnet-eventpipe"
 if errorlevel 1 goto :failed
 
-rem Stage 4: targeted 1 MiB object series, kept in a separate subfolder.
+rem Stage 5: targeted 1 MiB object series, kept in a separate subfolder.
 if /I "%SKIP_LARGE_OBJECT_SERIES%"=="1" goto :finish
 
 echo.
-echo [4/5] Running targeted 1 MiB large-object series...
+echo [5/6] Running targeted 1 MiB large-object series...
 set "RESULTS_SUBDIR=%BASE_RESULTS_SUBDIR%\large-object-series"
 set "GC_BENCH_SESSION_ID=%BASE_RESULTS_SUBDIR%\large-object-series"
 call "%ROOT%tools\run_repeat.bat" go large %RUNS% 64 10 1048576
 if errorlevel 1 goto :failed
 call "%ROOT%tools\run_repeat.bat" dotnet large %RUNS% 64 10 1048576
+if errorlevel 1 goto :failed
+call "%ROOT%tools\run_dotnet_gc_diagnostic.bat" "%BASE_RESULTS_SUBDIR%\large-object-series" %RUNS% 64 10 1048576 %WARMUP_BATCHES% large
 if errorlevel 1 goto :failed
 
 rem Baseline Java run uses default JVM settings and no JFR, like the other platforms.
@@ -165,12 +180,12 @@ if errorlevel 1 goto :failed
 call "%ROOT%tools\process_java_jfr.bat" large
 if errorlevel 1 goto :failed
 
-rem Build a separate cross-platform CSV and HTML report for the 1 MiB series.
+rem Stage 6: build separate reports for the 1 MiB series.
 echo.
-echo [5/5] Creating large-object comparison tables and charts...
+echo [6/6] Creating large-object comparison tables and charts...
 python "%ROOT%tools\summarize.py" "%ROOT%results\%BASE_RESULTS_SUBDIR%\large-object-series\go-large.jsonl" "%ROOT%results\%BASE_RESULTS_SUBDIR%\large-object-series\dotnet-large.jsonl" "%ROOT%results\%BASE_RESULTS_SUBDIR%\large-object-series\java-large.jsonl" -o "%ROOT%results\%BASE_RESULTS_SUBDIR%\large-object-series\comparison-large-objects.csv"
 if errorlevel 1 goto :failed
-python "%ROOT%tools\visualize_results.py" "%ROOT%results\%BASE_RESULTS_SUBDIR%\large-object-series\comparison-large-objects.csv" -o "%ROOT%results\%BASE_RESULTS_SUBDIR%\large-object-series\report-large-objects" --split-by-scenario --jfr-analysis-dir "%ROOT%results\%BASE_RESULTS_SUBDIR%\large-object-series\jfr-analysis"
+python "%ROOT%tools\visualize_results.py" "%ROOT%results\%BASE_RESULTS_SUBDIR%\large-object-series\comparison-large-objects.csv" -o "%ROOT%results\%BASE_RESULTS_SUBDIR%\large-object-series\report-large-objects" --split-by-scenario --jfr-analysis-dir "%ROOT%results\%BASE_RESULTS_SUBDIR%\large-object-series\jfr-analysis" --dotnet-eventpipe-analysis-dir "%ROOT%results\%BASE_RESULTS_SUBDIR%\large-object-series\dotnet-eventpipe"
 if errorlevel 1 goto :failed
 
 :finish
@@ -181,6 +196,7 @@ echo Results: %ROOT%results\%BASE_RESULTS_SUBDIR%
 echo Main CSV: %ROOT%results\%BASE_RESULTS_SUBDIR%\comparison-all-scenarios.csv
 echo Main charts: %ROOT%results\%BASE_RESULTS_SUBDIR%\report-all
 echo Java JFR analysis: %ROOT%results\%BASE_RESULTS_SUBDIR%\jfr-analysis
+echo .NET EventPipe analysis: %ROOT%results\%BASE_RESULTS_SUBDIR%\dotnet-eventpipe
 if /I not "%SKIP_LARGE_OBJECT_SERIES%"=="1" echo Large-object CSV: %ROOT%results\%BASE_RESULTS_SUBDIR%\large-object-series\comparison-large-objects.csv
 echo Experiment metadata: %ROOT%results\%BASE_RESULTS_SUBDIR%\experiment-info.txt
 echo ============================================================

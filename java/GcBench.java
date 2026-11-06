@@ -12,6 +12,8 @@ import java.nio.file.Path;
 import java.time.Duration;
 import com.sun.management.HotSpotDiagnosticMXBean;
 import jdk.jfr.Recording;
+import jdk.jfr.consumer.RecordedEvent;
+import jdk.jfr.consumer.RecordingFile;
 
 public final class GcBench {
     static final class Node {
@@ -38,12 +40,10 @@ public final class GcBench {
     static com.sun.management.ThreadMXBean getAllocationBean() {
         ThreadMXBean base = ManagementFactory.getThreadMXBean();
         if (base instanceof com.sun.management.ThreadMXBean bean && bean.isThreadAllocatedMemorySupported()) {
-            try {
-                if (!bean.isThreadAllocatedMemoryEnabled()) bean.setThreadAllocatedMemoryEnabled(true);
-                return bean;
-            } catch (SecurityException ignored) { }
+            if (!bean.isThreadAllocatedMemoryEnabled()) bean.setThreadAllocatedMemoryEnabled(true);
+            return bean;
         }
-        return null;
+        throw new IllegalStateException("The JVM does not support per-thread allocation counters required by this benchmark");
     }
 
     static Node[] makeNodes(int count, int payload, boolean graph) {
@@ -73,6 +73,11 @@ public final class GcBench {
     static long allocatedBytes() {
         if (allocationBean == null) return -1;
         return allocationBean.getThreadAllocatedBytes(Thread.currentThread().getId());
+    }
+
+    static long totalAllocatedBytes() {
+        if (allocationBean == null) return -1;
+        return allocationBean.getTotalThreadAllocatedBytes();
     }
 
     static long heapUsed() {
@@ -124,16 +129,43 @@ public final class GcBench {
         }
     }
 
-    static void requestFullGcAndWait() throws InterruptedException {
+    static void requestFullGcAndWait() throws Exception {
         ensureExplicitGcEnabled();
         Map<String, Long> previousCounts = gcCollectionCounts();
-        System.gc();
-        long deadline = System.nanoTime() + Duration.ofSeconds(60).toNanos();
-        while (!hasCompletedCollection(previousCounts)) {
-            if (System.nanoTime() >= deadline) {
-                throw new IllegalStateException("No completed GC was observed after System.gc(); refusing to report a full-GC heap snapshot");
+        Path recordingPath = java.nio.file.Files.createTempFile("gc-bench-explicit-gc-", ".jfr");
+        try {
+            try (Recording recording = new Recording()) {
+                recording.enable("jdk.GarbageCollection").withThreshold(Duration.ZERO).withoutStackTrace();
+                recording.enable("jdk.DataLoss").withThreshold(Duration.ZERO).withoutStackTrace();
+                recording.setToDisk(true);
+                recording.setDestination(recordingPath);
+                recording.start();
+                System.gc();
+                long deadline = System.nanoTime() + Duration.ofSeconds(60).toNanos();
+                while (!hasCompletedCollection(previousCounts)) {
+                    if (System.nanoTime() >= deadline) {
+                        throw new IllegalStateException("No completed GC was observed after System.gc(); refusing to report a full-GC heap snapshot");
+                    }
+                    Thread.sleep(10);
+                }
+                recording.stop();
             }
-            Thread.sleep(10);
+            boolean explicitGcObserved = false;
+            for (RecordedEvent event : RecordingFile.readAllEvents(recordingPath)) {
+                if (event.getEventType().getName().equals("jdk.DataLoss")) {
+                    throw new IllegalStateException("JFR reported lost events while verifying System.gc(); refusing to report a full-GC heap snapshot");
+                }
+                if (!event.getEventType().getName().equals("jdk.GarbageCollection")) continue;
+                if (event.hasField("cause") && event.getString("cause").contains("System.gc")) {
+                    explicitGcObserved = true;
+                    break;
+                }
+            }
+            if (!explicitGcObserved) {
+                throw new IllegalStateException("A GC completed after System.gc(), but JFR did not confirm an explicit-GC cause; refusing to report a full-GC heap snapshot");
+            }
+        } finally {
+            java.nio.file.Files.deleteIfExists(recordingPath);
         }
     }
 
@@ -214,18 +246,21 @@ public final class GcBench {
             if (jfrFile != null && !jfrFile.isBlank()) {
                 recording = new Recording();
                 recording.enable("jdk.GCPhasePause").withThreshold(Duration.ZERO).withoutStackTrace();
+                recording.enable("jdk.GarbageCollection").withThreshold(Duration.ZERO).withoutStackTrace();
+                recording.enable("jdk.DataLoss").withThreshold(Duration.ZERO).withoutStackTrace();
                 recording.setName("GC benchmark measured interval");
                 recording.setToDisk(true);
                 recording.setDestination(Path.of(jfrFile));
             }
-            long allocBefore = allocatedBytes();
+            long allocBefore = totalAllocatedBytes();
+            long mainThreadAllocBefore = allocatedBytes();
             long heapBefore = heapUsed();
             GcSnapshot gcBefore = new GcSnapshot();
             if (recording != null) recording.start();
-            long measurementStartUptimeMs = ManagementFactory.getRuntimeMXBean().getUptime();
-            long startNs = System.nanoTime();
             List<Double> batchTimes = new ArrayList<>(batches);
             long nodesCreated = 0, largeBuffers = 0, payloadRequested = 0;
+            long measurementStartUptimeMs = ManagementFactory.getRuntimeMXBean().getUptime();
+            long startNs = System.nanoTime();
 
             for (int b = 0; b < batches; b++) {
                 long batchStart = System.nanoTime();
@@ -279,9 +314,11 @@ public final class GcBench {
             // MXBeans and memory snapshots. Those reads allocate objects and can
             // otherwise trigger GC events that are outside the measured workload.
             if (recording != null) { recording.stop(); recording.close(); }
-            long allocAfter = allocatedBytes();
+            long allocAfter = totalAllocatedBytes();
+            long mainThreadAllocAfter = allocatedBytes();
             GcSnapshot gcAfter = new GcSnapshot();
             long allocDelta = (allocBefore < 0 || allocAfter < 0) ? -1 : allocAfter - allocBefore;
+            long mainThreadAllocDelta = (mainThreadAllocBefore < 0 || mainThreadAllocAfter < 0) ? -1 : mainThreadAllocAfter - mainThreadAllocBefore;
             requestFullGcAndWait();
             long heapAfterFullGc = heapUsed();
             long committedAfterFullGc = heapCommitted();
@@ -290,16 +327,17 @@ public final class GcBench {
 
             String inputArgs = ManagementFactory.getRuntimeMXBean().getInputArguments().toString();
             String json = "{" +
+                "\"schema_version\":2,\"metric_definitions\":{\"allocated_bytes_delta_all_threads\":{\"unit\":\"bytes\",\"source\":\"ThreadMXBean.getTotalThreadAllocatedBytes\",\"scope\":\"all_java_threads\",\"calculation\":\"total counter after - total counter before\",\"cross_platform_comparable\":false},\"allocated_bytes_delta_main_thread\":{\"unit\":\"bytes\",\"source\":\"ThreadMXBean.getThreadAllocatedBytes(currentThreadId)\",\"scope\":\"benchmark_thread\",\"calculation\":\"thread counter after - thread counter before\",\"cross_platform_comparable\":false},\"allocated_bytes_per_second\":{\"unit\":\"bytes/s\",\"source\":\"ThreadMXBean.getTotalThreadAllocatedBytes\",\"scope\":\"all_java_threads\",\"calculation\":\"allocated_bytes_delta_all_threads / elapsed_seconds\",\"cross_platform_comparable\":false},\"gc_collector_counts\":{\"unit\":\"collections\",\"source\":\"GarbageCollectorMXBean.getCollectionCount\",\"scope\":\"each_collector_separately\",\"calculation\":\"per-collector counter after - counter before; never summed\",\"cross_platform_comparable\":false},\"gc_pause_distribution\":{\"unit\":\"ms\",\"source\":\"JFR jdk.GCPhasePause\",\"scope\":\"separate_diagnostic_recording\",\"calculation\":\"individual JFR pause event durations\",\"cross_platform_comparable\":false}}," +
                 "\"platform\":\"java\",\"session_id\":\"" + jsonEscape(System.getenv().getOrDefault("GC_BENCH_SESSION_ID", "")) + "\",\"repetition\":\"" + jsonEscape(System.getenv().getOrDefault("GC_BENCH_REPETITION", "")) + "\",\"expected_repetitions\":\"" + jsonEscape(System.getenv().getOrDefault("GC_BENCH_EXPECTED_REPETITIONS", "")) + "\",\"run_order\":\"" + jsonEscape(System.getenv().getOrDefault("GC_BENCH_RUN_ORDER", "")) + "\",\"runtime_version\":\"" + jsonEscape(System.getProperty("java.runtime.version")) + "\",\"vm_name\":\"" + jsonEscape(System.getProperty("java.vm.name")) + "\"," +
                 "\"os\":\"" + jsonEscape(System.getProperty("os.name") + " " + System.getProperty("os.version")) + "\",\"architecture\":\"" + jsonEscape(System.getProperty("os.arch")) + "\"," +
                 "\"scenario\":\"" + scenario + "\",\"batches\":" + batches + ",\"warmup_batches\":" + warmupBatches + ",\"measurement_start_uptime_ms\":" + measurementStartUptimeMs + ",\"items\":" + items + ",\"payload_bytes\":" + payload + "," +
                 "\"objects_created_nodes\":" + nodesCreated + ",\"retained_nodes_after\":" + retained.size() + ",\"large_buffers_created\":" + largeBuffers + ",\"payload_bytes_requested\":" + payloadRequested + ",\"elapsed_ms\":" + elapsedMs + "," +
-                "\"logical_nodes_per_second\":" + (nodesCreated / (elapsedMs / 1000.0)) + ",\"payload_bytes_per_second\":" + (payloadRequested / (elapsedMs / 1000.0)) + ",\"allocated_bytes_per_second\":" + (allocDelta < 0 ? "null" : Double.toString(allocDelta / (elapsedMs / 1000.0))) + ",\"allocated_bytes_scope\":\"benchmark_thread\"," +
+                "\"logical_nodes_per_second\":" + (nodesCreated / (elapsedMs / 1000.0)) + ",\"payload_bytes_per_second\":" + (payloadRequested / (elapsedMs / 1000.0)) + ",\"allocated_bytes_per_second\":" + (allocDelta < 0 ? "null" : Double.toString(allocDelta / (elapsedMs / 1000.0))) + ",\"allocated_bytes_scope\":\"all_java_threads_runtime_counter\",\"allocated_bytes_cross_platform_comparable\":false," +
                 "\"batch_latency_ms\":{\"p50\":" + nullableNumber(percentile(batchTimes,.50)) + ",\"p95\":" + nullableNumber(percentile(batchTimes,.95)) + ",\"p99\":" + nullableNumber(percentile(batchTimes,.99)) + ",\"samples\":" + batchTimes.size() + "}," +
-                "\"metrics\":{\"allocated_bytes_delta_main_thread\":" + (allocDelta < 0 ? "null" : Long.toString(allocDelta)) + ",\"heap_used_bytes_before\":" + heapBefore + ",\"heap_used_bytes_after_full_gc\":" + heapAfterFullGc + ",\"heap_committed_bytes_after_full_gc\":" + committedAfterFullGc + "," +
+                "\"metrics\":{\"allocated_bytes_delta_all_threads\":" + (allocDelta < 0 ? "null" : Long.toString(allocDelta)) + ",\"allocated_bytes_delta_main_thread\":" + (mainThreadAllocDelta < 0 ? "null" : Long.toString(mainThreadAllocDelta)) + ",\"heap_used_bytes_before\":" + heapBefore + ",\"heap_used_bytes_after_full_gc\":" + heapAfterFullGc + ",\"heap_committed_bytes_after_full_gc\":" + committedAfterFullGc + "," +
                 "\"gc_stw_pause_total_ms\":null}," +
                 "\"gc_collectors_delta\":" + collectorJson(gcBefore, gcAfter) + ",\"jfr_file\":" + (jfrFile == null ? "null" : "\"" + jsonEscape(jfrFile) + "\"") + ",\"jvm_input_arguments\":\"" + jsonEscape(inputArgs) + "\",\"checksum\":" + checksum + "," +
-                "\"note\":\"Java allocation counter covers the benchmark thread only, not JVM service threads. MXBean collection counts and elapsed times are reported separately per collector; elapsed time is approximate and is not stop-the-world pause time. Warm-up and verified System.gc() cleanup are excluded from measured deltas. When --jfr-file is supplied, only jdk.GCPhasePause is recorded for the measured interval.\"}";
+                "\"note\":\"Java allocation metrics preserve both the all-thread runtime counter and benchmark-thread counter; neither is treated as cross-platform comparable because runtime counter scopes differ. MXBean collection counts and elapsed times are reported separately per collector; elapsed time is approximate and is not stop-the-world pause time. Full-GC snapshots require a JFR jdk.GarbageCollection event whose cause confirms System.gc(), with no jdk.DataLoss event. When --jfr-file is supplied, only jdk.GCPhasePause, jdk.GarbageCollection, and jdk.DataLoss are recorded for the measured interval.\"}";
             System.out.println(json);
         } catch (Exception ex) {
             System.err.println(ex.getMessage());

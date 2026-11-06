@@ -74,7 +74,7 @@ def find_jfr(command: str | None) -> str:
 
 def read_events(jfr: str, recording: Path) -> list[dict]:
     completed = subprocess.run(
-        [jfr, "print", "--json", "--events", "jdk.GCPhasePause", str(recording)],
+        [jfr, "print", "--json", "--events", "jdk.GCPhasePause,jdk.DataLoss", str(recording)],
         check=True,
         capture_output=True,
         text=True,
@@ -83,8 +83,18 @@ def read_events(jfr: str, recording: Path) -> list[dict]:
     )
     doc = json.loads(completed.stdout)
     result = []
-    for event in doc.get("recording", {}).get("events", []):
+    events = doc.get("recording", {}).get("events", [])
+    losses = [
+        event for event in events
+        if event.get("type") == "jdk.DataLoss"
+    ]
+    if losses:
+        amounts = [event.get("values", {}).get("amount", "unknown") for event in losses]
+        raise ValueError(f"JFR reported data loss (amounts: {amounts})")
+    for event in events:
         values = event.get("values", {})
+        if event.get("type") != "jdk.GCPhasePause":
+            continue
         duration = values.get("duration")
         if not duration:
             continue

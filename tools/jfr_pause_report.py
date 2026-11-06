@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -36,15 +37,26 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("recording", help="JFR file recorded by GcBench --jfr-file")
     ap.add_argument("-o", "--output", default="jfr-gc-pauses.csv", help="CSV with individual GC pause events")
+    ap.add_argument("--jfr-command", help="Path to jfr.exe / jfr executable")
     args = ap.parse_args()
 
+    jfr = args.jfr_command or shutil.which("jfr") or shutil.which("jfr.exe")
+    if not jfr:
+        raise FileNotFoundError("jfr not found in PATH; pass --jfr-command with the JDK executable path")
     result = subprocess.run(
-        ["jfr", "print", "--json", "--events", "jdk.GCPhasePause", args.recording],
+        [jfr, "print", "--json", "--events", "jdk.GCPhasePause,jdk.DataLoss", args.recording],
         check=True, capture_output=True, text=True,
     )
     document = json.loads(result.stdout)
+    all_events = document.get("recording", {}).get("events", [])
+    losses = [event for event in all_events if event.get("type") == "jdk.DataLoss"]
+    if losses:
+        amounts = [event.get("values", {}).get("amount", "unknown") for event in losses]
+        raise ValueError(f"JFR reported data loss (amounts: {amounts})")
     events = []
-    for event in document.get("recording", {}).get("events", []):
+    for event in all_events:
+        if event.get("type") != "jdk.GCPhasePause":
+            continue
         values = event.get("values", {})
         duration_ms = iso_duration_seconds(values["duration"]) * 1000.0
         events.append({

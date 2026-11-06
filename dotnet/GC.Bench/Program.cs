@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Diagnostics.Tracing;
 using System.Runtime;
 using System.Text.Json;
 
@@ -10,6 +11,18 @@ sealed class Node
     public byte[] Payload = Array.Empty<byte>();
 }
 
+[EventSource(Name = "GC.Bench")]
+public sealed class BenchmarkTrace : EventSource
+{
+    public static readonly BenchmarkTrace Log = new();
+
+    [Event(1, Level = EventLevel.Informational)]
+    public void MeasurementStart() => WriteEvent(1);
+
+    [Event(2, Level = EventLevel.Informational)]
+    public void MeasurementEnd() => WriteEvent(2);
+}
+
 static class Program
 {
     private static volatile Node[]? _sinkNodes;
@@ -19,7 +32,7 @@ static class Program
 
     private sealed record Snapshot(long Allocated, long HeapUsed, long HeapCommitted,
         TimeSpan PauseTotal, int Gen0, int Gen1, int Gen2, double PausePercent,
-        long FragmentedBytes, long WorkingSet, long GcIndex);
+        long FragmentedBytes, long WorkingSet);
 
     private static Node[] MakeNodes(int count, int payload, bool graph)
     {
@@ -77,26 +90,17 @@ static class Program
 
     private static Snapshot ReadSnapshot()
     {
+        var allocated = GC.GetTotalAllocatedBytes(precise: false);
         var info = GC.GetGCMemoryInfo(GCKind.Any);
         using var process = Process.GetCurrentProcess();
         process.Refresh();
         return new Snapshot(
-            GC.GetTotalAllocatedBytes(precise: false),
+            allocated,
             GC.GetTotalMemory(forceFullCollection: false),
             info.TotalCommittedBytes,
             GC.GetTotalPauseDuration(),
             GC.CollectionCount(0), GC.CollectionCount(1), GC.CollectionCount(2),
-            info.PauseTimePercentage, info.FragmentedBytes, process.WorkingSet64, info.Index);
-    }
-
-    private static void CapturePauseDurations(ref long lastGcIndex, List<double> samples, ref long skippedCollections)
-    {
-        var info = GC.GetGCMemoryInfo(GCKind.Any);
-        if (info.Index <= lastGcIndex) return;
-        skippedCollections += Math.Max(0, info.Index - lastGcIndex - 1);
-        foreach (var duration in info.PauseDurations)
-            samples.Add(duration.TotalMilliseconds);
-        lastGcIndex = info.Index;
+            info.PauseTimePercentage, info.FragmentedBytes, process.WorkingSet64);
     }
 
     private static double? Percentile(List<double> values, double p)
@@ -114,8 +118,14 @@ static class Program
     {
         string scenario = "transient";
         int batches = 1000, warmupBatches = 50, items = 10000, payload = 128;
+        bool diagnosticMarkers = false;
         for (int i = 0; i < args.Length; i++)
         {
+            if (args[i] == "--diagnostic-markers")
+            {
+                diagnosticMarkers = true;
+                continue;
+            }
             string value = (i + 1 < args.Length) ? args[++i] : throw new ArgumentException("Missing argument value");
             switch (args[i - 1])
             {
@@ -158,12 +168,13 @@ static class Program
             Retained.EnsureCapacity(checked(retainedPerBatch * batches));
         }
         var before = ReadSnapshot();
-        var total = Stopwatch.StartNew();
         var batchTimes = new List<double>(batches);
-        var pauseDurations = new List<double>();
-        long lastGcIndex = before.GcIndex;
-        long skippedPauseCollections = 0;
         long nodesCreated = 0, largeBuffers = 0, payloadRequested = 0;
+        if (diagnosticMarkers)
+        {
+            BenchmarkTrace.Log.MeasurementStart();
+        }
+        var total = Stopwatch.StartNew();
 
         for (int b = 0; b < batches; b++)
         {
@@ -217,10 +228,9 @@ static class Program
             }
             sw.Stop();
             batchTimes.Add(sw.Elapsed.TotalMilliseconds);
-            CapturePauseDurations(ref lastGcIndex, pauseDurations, ref skippedPauseCollections);
         }
-        CapturePauseDurations(ref lastGcIndex, pauseDurations, ref skippedPauseCollections);
         total.Stop();
+        if (diagnosticMarkers) BenchmarkTrace.Log.MeasurementEnd();
         GC.KeepAlive(Retained);
         GC.KeepAlive(_sinkNodes);
         GC.KeepAlive(_sinkBytes);
@@ -233,6 +243,14 @@ static class Program
 
         var result = new
         {
+            schema_version = 2,
+            metric_definitions = new
+            {
+                allocated_bytes_delta = new { unit = "bytes", source = "GC.GetTotalAllocatedBytes(precise: false)", scope = "dotnet_managed_process", calculation = "counter_after - counter_before", cross_platform_comparable = false },
+                allocated_bytes_per_second = new { unit = "bytes/s", source = "GC.GetTotalAllocatedBytes(precise: false)", scope = "dotnet_managed_process", calculation = "allocated_bytes_delta / elapsed_seconds", cross_platform_comparable = false },
+                gc_collection_counts = new { unit = "collections", source = "GC.CollectionCount", scope = "measured_interval", calculation = "separate deltas for generations 0, 1, and 2", cross_platform_comparable = false },
+                gc_pause_distribution = new { unit = "ms", source = "EventPipe CLR GC suspend/restart events", scope = "separate_diagnostic_process", calculation = "full pause is GCSuspendEEStart to GCRestartEEStop; fully suspended duration is also reported; GCStart supplies generation, reason, and type", cross_platform_comparable = false }
+            },
             platform = "dotnet",
             session_id = Environment.GetEnvironmentVariable("GC_BENCH_SESSION_ID"),
             repetition = Environment.GetEnvironmentVariable("GC_BENCH_REPETITION"),
@@ -248,7 +266,8 @@ static class Program
             logical_nodes_per_second = nodesCreated / total.Elapsed.TotalSeconds,
             payload_bytes_per_second = payloadRequested / total.Elapsed.TotalSeconds,
             allocated_bytes_per_second = (after.Allocated - before.Allocated) / total.Elapsed.TotalSeconds,
-            allocated_bytes_scope = "process",
+            allocated_bytes_scope = "dotnet_managed_process",
+            allocated_bytes_cross_platform_comparable = false,
             batch_latency_ms = new { p50 = Percentile(batchTimes, .50), p95 = Percentile(batchTimes, .95), p99 = Percentile(batchTimes, .99), samples = batchTimes.Count },
             metrics = new
             {
@@ -260,21 +279,11 @@ static class Program
                 gen1_collections_delta = after.Gen1 - before.Gen1,
                 gen2_collections_delta = after.Gen2 - before.Gen2,
                 gc_stw_pause_total_ms_delta = (after.PauseTotal - before.PauseTotal).TotalMilliseconds,
-                gc_pause_durations_ms = new
-                {
-                    p50 = Percentile(pauseDurations, .50),
-                    p95 = Percentile(pauseDurations, .95),
-                    max = pauseDurations.Count == 0 ? (double?)null : pauseDurations.Max(),
-                    samples = pauseDurations.Count,
-                    observed_gc_collections = after.GcIndex - before.GcIndex - skippedPauseCollections,
-                    skipped_gc_collections = skippedPauseCollections,
-                    durations = pauseDurations
-                },
                 gc_pause_share_percent_process_cumulative = after.PausePercent,
                 process_working_set_bytes_after = after.WorkingSet
             },
             checksum = _checksum,
-            note = "Warm-up and two explicit full collections are excluded from measured deltas. GetTotalPauseDuration measures managed-thread suspension attributed to GC. PauseDurations snapshots are sampled after each batch and may miss multiple collections within one batch; snapshot polling is included in elapsed_ms but excluded from batch_latency_ms. WorkingSet is a point-in-time process working set, not peak RSS."
+            note = "Warm-up and two explicit full collections are excluded from measured deltas. GetTotalPauseDuration measures managed-thread suspension attributed to GC. Individual pauses are captured only in separate EventPipe diagnostics: full pause is GCSuspendEEStart to GCRestartEEStop, while fully suspended time is reported separately. WorkingSet is a point-in-time process working set, not peak RSS."
         };
         return result;
     }
