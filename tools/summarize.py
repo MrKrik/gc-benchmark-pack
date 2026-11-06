@@ -7,7 +7,7 @@ from pathlib import Path
 
 
 def flatten(record):
-    row = {k: v for k, v in record.items() if k not in {"metrics", "batch_latency_ms", "gc_collectors_delta", "metric_definitions"}}
+    row = {k: v for k, v in record.items() if k not in {"metrics", "batch_latency_ms", "gc_collectors_delta", "metric_definitions", "memory_metrics", "memory_metric_definitions", "gc_configuration"}}
     def add_nested(prefix, value):
         if isinstance(value, dict):
             for key, nested in value.items():
@@ -15,7 +15,7 @@ def flatten(record):
         else:
             row[prefix] = value
 
-    for group in ("metrics", "batch_latency_ms", "metric_definitions"):
+    for group in ("metrics", "batch_latency_ms", "metric_definitions", "memory_metrics", "memory_metric_definitions", "gc_configuration"):
         for key, value in record.get(group, {}).items():
             add_nested(f"{group}.{key}", value)
     for collector, values in record.get("gc_collectors_delta", {}).items():

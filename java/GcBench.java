@@ -224,22 +224,50 @@ public final class GcBench {
             ensureExplicitGcEnabled();
 
             retained.clear(); sinkNodes = null; sinkBytes = null;
+            int retainedPerBatch = Math.max(1, items / 10);
+            if (scenario.equals("retained") || scenario.equals("mixed"))
+                retained.ensureCapacity(Math.multiplyExact(retainedPerBatch, warmupBatches));
             int warmItems = items;
             for (int b = 0; b < warmupBatches; b++) {
-                if (scenario.equals("large")) {
-                    sinkBytes = new byte[warmItems][];
-                    for (int i = 0; i < warmItems; i++) sinkBytes[i] = new byte[payload];
-                    sinkBytes = null;
-                } else {
-                    sinkNodes = makeNodes(warmItems, payload, scenario.equals("graph"));
-                    touch(sinkNodes);
-                    sinkNodes = null;
+                switch (scenario) {
+                    case "retained" -> {
+                        Node[] batch = makeNodes(warmItems, payload, false);
+                        for (int i = 0; i < retainedPerBatch; i++)
+                            retained.add(batch[(int) ((long) i * warmItems / retainedPerBatch)]);
+                        sinkNodes = batch;
+                        touch(sinkNodes);
+                        sinkNodes = null;
+                    }
+                    case "mixed" -> {
+                        Node[] batch = makeNodes(warmItems, payload, false);
+                        for (int i = 0; i < retainedPerBatch; i++)
+                            retained.add(batch[(int) ((long) i * warmItems / retainedPerBatch)]);
+                        sinkNodes = batch;
+                        touch(sinkNodes);
+                        sinkBytes = new byte[][]{new byte[Math.max(1, Math.multiplyExact(payload, 16))]};
+                        checksum += Byte.toUnsignedInt(sinkBytes[0][0]);
+                        sinkNodes = null;
+                        sinkBytes = null;
+                    }
+                    case "large" -> {
+                        sinkBytes = new byte[warmItems][];
+                        for (int i = 0; i < warmItems; i++) {
+                            sinkBytes[i] = new byte[payload];
+                            if (payload > 0) sinkBytes[i][0] = (byte) i;
+                        }
+                        if (warmItems > 0 && payload > 0) checksum += Byte.toUnsignedInt(sinkBytes[0][0]);
+                        sinkBytes = null;
+                    }
+                    default -> {
+                        sinkNodes = makeNodes(warmItems, payload, scenario.equals("graph"));
+                        touch(sinkNodes);
+                        sinkNodes = null;
+                    }
                 }
             }
             retained.clear(); sinkNodes = null; sinkBytes = null;
             // Explicit full-GC request is part of the unmeasured warm-up/reset phase.
             requestFullGcAndWait();
-            int retainedPerBatch = Math.max(1, items / 10);
             if (scenario.equals("retained") || scenario.equals("mixed"))
                 retained.ensureCapacity(Math.multiplyExact(retainedPerBatch, batches));
             Recording recording = null;
@@ -326,9 +354,22 @@ public final class GcBench {
             if (retained.size() > 0) checksum += retained.get(0).id;
 
             String inputArgs = ManagementFactory.getRuntimeMXBean().getInputArguments().toString();
+            String javaOptions = System.getenv().getOrDefault("JAVA_OPTS", "");
+            String configurationId = System.getenv().getOrDefault("GC_BENCH_JAVA_CONFIGURATION", "");
+            if (configurationId.isBlank()) configurationId = inputArgs.equals("[]") ? "java-default" : "java-custom";
+            HotSpotDiagnosticMXBean hotspot = ManagementFactory.getPlatformMXBean(HotSpotDiagnosticMXBean.class);
+            String g1RegionSize = hotspot.getVMOption("G1HeapRegionSize").getValue();
+            String gcConfiguration = "{\"java_opts\":\"" + jsonEscape(javaOptions) +
+                "\",\"input_arguments\":\"" + jsonEscape(inputArgs) + "\",\"collectors\":" +
+                ManagementFactory.getGarbageCollectorMXBeans().stream()
+                    .map(gc -> "\"" + jsonEscape(gc.getName()) + "\"")
+                    .collect(java.util.stream.Collectors.joining(",", "[", "]")) +
+                ",\"heap_initial_bytes\":" + ManagementFactory.getMemoryMXBean().getHeapMemoryUsage().getInit() +
+                ",\"heap_max_bytes\":" + Runtime.getRuntime().maxMemory() +
+                ",\"g1_region_size_bytes\":" + g1RegionSize + "}";
             String json = "{" +
                 "\"schema_version\":2,\"metric_definitions\":{\"allocated_bytes_delta_all_threads\":{\"unit\":\"bytes\",\"source\":\"ThreadMXBean.getTotalThreadAllocatedBytes\",\"scope\":\"all_java_threads\",\"calculation\":\"total counter after - total counter before\",\"cross_platform_comparable\":false},\"allocated_bytes_delta_main_thread\":{\"unit\":\"bytes\",\"source\":\"ThreadMXBean.getThreadAllocatedBytes(currentThreadId)\",\"scope\":\"benchmark_thread\",\"calculation\":\"thread counter after - thread counter before\",\"cross_platform_comparable\":false},\"allocated_bytes_per_second\":{\"unit\":\"bytes/s\",\"source\":\"ThreadMXBean.getTotalThreadAllocatedBytes\",\"scope\":\"all_java_threads\",\"calculation\":\"allocated_bytes_delta_all_threads / elapsed_seconds\",\"cross_platform_comparable\":false},\"gc_collector_counts\":{\"unit\":\"collections\",\"source\":\"GarbageCollectorMXBean.getCollectionCount\",\"scope\":\"each_collector_separately\",\"calculation\":\"per-collector counter after - counter before; never summed\",\"cross_platform_comparable\":false},\"gc_pause_distribution\":{\"unit\":\"ms\",\"source\":\"JFR jdk.GCPhasePause\",\"scope\":\"separate_diagnostic_recording\",\"calculation\":\"individual JFR pause event durations\",\"cross_platform_comparable\":false}}," +
-                "\"platform\":\"java\",\"session_id\":\"" + jsonEscape(System.getenv().getOrDefault("GC_BENCH_SESSION_ID", "")) + "\",\"repetition\":\"" + jsonEscape(System.getenv().getOrDefault("GC_BENCH_REPETITION", "")) + "\",\"expected_repetitions\":\"" + jsonEscape(System.getenv().getOrDefault("GC_BENCH_EXPECTED_REPETITIONS", "")) + "\",\"run_order\":\"" + jsonEscape(System.getenv().getOrDefault("GC_BENCH_RUN_ORDER", "")) + "\",\"runtime_version\":\"" + jsonEscape(System.getProperty("java.runtime.version")) + "\",\"vm_name\":\"" + jsonEscape(System.getProperty("java.vm.name")) + "\"," +
+                "\"platform\":\"java\",\"runtime_configuration_id\":\"" + jsonEscape(configurationId) + "\",\"gc_configuration\":" + gcConfiguration + ",\"session_id\":\"" + jsonEscape(System.getenv().getOrDefault("GC_BENCH_SESSION_ID", "")) + "\",\"repetition\":\"" + jsonEscape(System.getenv().getOrDefault("GC_BENCH_REPETITION", "")) + "\",\"expected_repetitions\":\"" + jsonEscape(System.getenv().getOrDefault("GC_BENCH_EXPECTED_REPETITIONS", "")) + "\",\"run_order\":\"" + jsonEscape(System.getenv().getOrDefault("GC_BENCH_RUN_ORDER", "")) + "\",\"runtime_version\":\"" + jsonEscape(System.getProperty("java.runtime.version")) + "\",\"vm_name\":\"" + jsonEscape(System.getProperty("java.vm.name")) + "\"," +
                 "\"os\":\"" + jsonEscape(System.getProperty("os.name") + " " + System.getProperty("os.version")) + "\",\"architecture\":\"" + jsonEscape(System.getProperty("os.arch")) + "\"," +
                 "\"scenario\":\"" + scenario + "\",\"batches\":" + batches + ",\"warmup_batches\":" + warmupBatches + ",\"measurement_start_uptime_ms\":" + measurementStartUptimeMs + ",\"items\":" + items + ",\"payload_bytes\":" + payload + "," +
                 "\"objects_created_nodes\":" + nodesCreated + ",\"retained_nodes_after\":" + retained.size() + ",\"large_buffers_created\":" + largeBuffers + ",\"payload_bytes_requested\":" + payloadRequested + ",\"elapsed_ms\":" + elapsedMs + "," +

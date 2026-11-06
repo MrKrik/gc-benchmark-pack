@@ -61,6 +61,26 @@ DIAGNOSTIC_METRICS = [
     ("java_allocated_bytes_per_second", "Java: скорость аллокаций всех Java-потоков", "bytes/s", {
         "java": "allocated_bytes_per_second.all_java_threads_runtime_counter",
     }, "ThreadMXBean total all-threads counter; сохраняется также счетчик потока теста. Не сравнивается с Go или .NET."),
+    ("peak_working_set_bytes", "Пик Working Set процесса", "bytes", {
+        "go": "memory_metrics.peak_working_set_bytes",
+        "dotnet": "memory_metrics.peak_working_set_bytes",
+        "java": "memory_metrics.peak_working_set_bytes",
+    }, "Пиковый resident Working Set процесса за запуск; Windows берёт пик из PSAPI, Linux — VmHWM, macOS — максимум периодических выборок."),
+    ("average_sampled_working_set_bytes", "Средний выборочный Working Set", "bytes", {
+        "go": "memory_metrics.average_sampled_working_set_bytes",
+        "dotnet": "memory_metrics.average_sampled_working_set_bytes",
+        "java": "memory_metrics.average_sampled_working_set_bytes",
+    }, "Среднее по внешним выборкам с периодом, указанным в memory_metrics.sampling_interval_ms; отдельная диагностическая метрика."),
+    ("initial_working_set_bytes", "Начальный Working Set процесса", "bytes", {
+        "go": "memory_metrics.initial_working_set_bytes",
+        "dotnet": "memory_metrics.initial_working_set_bytes",
+        "java": "memory_metrics.initial_working_set_bytes",
+    }, "Первый доступный снимок после запуска процесса."),
+    ("final_working_set_bytes", "Конечный Working Set процесса", "bytes", {
+        "go": "memory_metrics.final_working_set_bytes",
+        "dotnet": "memory_metrics.final_working_set_bytes",
+        "java": "memory_metrics.final_working_set_bytes",
+    }, "Последний снимок до завершения процесса."),
 ]
 DIAGNOSTIC_VALUE_PATHS = {
     name: paths for name, _, _, paths, _ in DIAGNOSTIC_METRICS
@@ -378,6 +398,55 @@ def dotnet_eventpipe_report_section(scenario, analysis_dir):
         ) + "</tr>"
         for item in run_rows
     )
+    chart_width, chart_height = 760, 280
+    left, top, plot_width, plot_height = 58, 24, 660, 190
+    pause_series = [
+        ("pause_p50_ms", "p50", "#4c78a8"),
+        ("pause_p95_ms", "p95", "#f58518"),
+        ("pause_p99_ms", "p99", "#54a24b"),
+    ]
+    chart_values = [
+        number(item.get(key))
+        for item in run_rows
+        for key, _, _ in pause_series
+    ]
+    chart_values = [value for value in chart_values if value is not None and value >= 0]
+    pause_chart = ""
+    if chart_values:
+        y_max = max(chart_values) or 1.0
+        svg_parts = [
+            f'<svg role="img" aria-label="Распределение индивидуальных пауз .NET по запускам" '
+            f'viewBox="0 0 {chart_width} {chart_height}" class="diagnostic-chart">',
+            f'<line x1="{left}" y1="{top + plot_height}" x2="{left + plot_width}" y2="{top + plot_height}" stroke="#777"/>',
+            f'<line x1="{left}" y1="{top}" x2="{left}" y2="{top + plot_height}" stroke="#777"/>',
+            f'<text x="8" y="{top + 8}">{y_max:.3g} ms</text>',
+            f'<text x="18" y="{top + plot_height}">0</text>',
+        ]
+        for key, label, color in pause_series:
+            points = []
+            for index, item in enumerate(run_rows):
+                value = number(item.get(key))
+                if value is None or value < 0:
+                    continue
+                x = left + (plot_width / 2 if len(run_rows) == 1 else index * plot_width / (len(run_rows) - 1))
+                y = top + plot_height - (value / y_max * plot_height)
+                points.append(f"{x:.1f},{y:.1f}")
+            if points:
+                svg_parts.append(
+                    f'<polyline fill="none" stroke="{color}" stroke-width="2" points="{" ".join(points)}"/>'
+                )
+                svg_parts.append(
+                    f'<text x="{left + 8 + len(svg_parts) * 90}" y="{chart_height - 18}" fill="{color}">{label}</text>'
+                )
+        for index, item in enumerate(run_rows):
+            x = left + (plot_width / 2 if len(run_rows) == 1 else index * plot_width / (len(run_rows) - 1))
+            svg_parts.append(f'<text x="{x:.1f}" y="{top + plot_height + 18}" text-anchor="middle">{index + 1}</text>')
+        svg_parts.append("</svg>")
+        pause_chart = (
+            '<h3>Индивидуальные паузы по диагностическим запускам</h3>'
+            + "".join(svg_parts)
+            + "<p>Отдельные EventPipe-процессы; график не содержит измерений основного performance-прогона.</p>"
+        )
     return (
         '<section><h2>.NET EventPipe — индивидуальные паузы GC</h2>'
         f'<p>Отдельные диагностические запуски: {len(run_rows)}. '
@@ -386,6 +455,7 @@ def dotnet_eventpipe_report_section(scenario, analysis_dir):
         "(GCSuspendEEStop → GCRestartEEStart). "
         "поколение, причина и тип берутся из GCStart. Потери/несопоставленные события "
         "проверяются до включения данных в отчёт. Эти запуски не входят в таблицы времени выполнения.</p>"
+        f"{pause_chart}"
         f'<div class="table-wrap"><table><thead><tr>{headers}</tr></thead>'
         f"<tbody>{body}</tbody></table></div>"
         f'<p>Подробные события: <code>{html.escape(str(analysis_dir))}\\pause-events.csv</code> '
@@ -412,6 +482,16 @@ def main():
         raise ValueError(
             "The CSV contains multiple experiment sessions. Generate separate reports "
             "per session; do not pool process-level confidence intervals across sessions."
+        )
+    java_configurations = {
+        row.get("runtime_configuration_id")
+        for row in rows
+        if row.get("platform") == "java" and row.get("runtime_configuration_id")
+    }
+    if len(java_configurations) > 1:
+        raise ValueError(
+            "The CSV contains multiple Java runtime configurations. "
+            "Generate separate reports; do not combine baseline and diagnostic JVM settings."
         )
     output = Path(args.output_dir)
     output.mkdir(parents=True, exist_ok=True)

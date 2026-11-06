@@ -1,5 +1,7 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
+set "GC_BENCH_JAVA_CONFIGURATION=java-jfr-diagnostic"
+if defined GC_BENCH_JFR_CONFIGURATION set "GC_BENCH_JAVA_CONFIGURATION=%GC_BENCH_JFR_CONFIGURATION%"
 
 rem Run repeated Java GC tests and save one JFR recording per process.
 rem Existing results for the same scenario are preserved unless the user confirms overwrite.
@@ -38,6 +40,16 @@ if not exist "%JFR_DIR%" mkdir "%JFR_DIR%"
 where javac >nul 2>nul || (echo ERROR: javac not found in PATH. Install a JDK.& exit /b 1)
 where java >nul 2>nul || (echo ERROR: java not found in PATH. Install a JDK.& exit /b 1)
 where jfr >nul 2>nul || (echo ERROR: jfr not found in PATH. Add the JDK bin directory to PATH.& exit /b 1)
+for /f "tokens=2" %%V in ('javac -version 2^>^&1') do set "JDK_VERSION=%%V"
+for /f "tokens=1 delims=." %%V in ("%JDK_VERSION%") do set "JDK_MAJOR=%%V"
+if not defined JDK_MAJOR (
+  echo ERROR: Could not determine the JDK version.
+  exit /b 1
+)
+if %JDK_MAJOR% LSS 21 (
+  echo ERROR: JDK 21 or newer is required; found javac %JDK_VERSION%.
+  exit /b 1
+)
 
 rem Compile before asking to replace prior results, so a compilation error
 rem cannot cause the previous successful series to be deleted.

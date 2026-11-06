@@ -208,6 +208,16 @@ if errorlevel 1 (
     echo ERROR: java was not found in PATH.
     exit /b 1
 )
+for /f "tokens=2" %%V in ('javac -version 2^>^&1') do set "JDK_VERSION=%%V"
+for /f "tokens=1 delims=." %%V in ("%JDK_VERSION%") do set "JDK_MAJOR=%%V"
+if not defined JDK_MAJOR (
+    echo ERROR: Could not determine the JDK version.
+    exit /b 1
+)
+if %JDK_MAJOR% LSS 21 (
+    echo ERROR: JDK 21 or newer is required; found javac %JDK_VERSION%.
+    exit /b 1
+)
 pushd "%ROOT%\java" || exit /b 1
 javac GcBench.java
 set "BUILD_RC=%ERRORLEVEL%"

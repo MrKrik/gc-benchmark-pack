@@ -45,6 +45,16 @@ if errorlevel 1 (
   goto :preflight_failed
 )
 where javac >nul 2>nul || (echo ERROR: JDK javac not found in PATH.& goto :preflight_failed)
+for /f "tokens=2" %%V in ('javac -version 2^>^&1') do set "JDK_VERSION=%%V"
+for /f "tokens=1 delims=." %%V in ("%JDK_VERSION%") do set "JDK_MAJOR=%%V"
+if not defined JDK_MAJOR (
+  echo ERROR: Could not determine the JDK version.
+  goto :preflight_failed
+)
+if %JDK_MAJOR% LSS 21 (
+  echo ERROR: JDK 21 or newer is required; found javac %JDK_VERSION%.
+  goto :preflight_failed
+)
 where java >nul 2>nul || (echo ERROR: Java runtime not found in PATH.& goto :preflight_failed)
 where jfr >nul 2>nul
 if errorlevel 1 if defined JAVA_HOME if exist "%JAVA_HOME%\bin\jfr.exe" set "PATH=%JAVA_HOME%\bin;%PATH%"
@@ -66,6 +76,10 @@ set "RESULTS_SUBDIR=run_%RUN_ID%"
 set "BASE_RESULTS_SUBDIR=%RESULTS_SUBDIR%"
 set "GC_BENCH_SESSION_ID=%BASE_RESULTS_SUBDIR%"
 set "GC_BENCH_EXPECTED_REPETITIONS=%RUNS%"
+set "GC_BENCH_JAVA_CONFIGURATION=java-baseline-default"
+if defined JAVA_OPTS set "GC_BENCH_JAVA_CONFIGURATION=java-baseline-custom-options"
+if defined JAVA_TOOL_OPTIONS set "GC_BENCH_JAVA_CONFIGURATION=java-baseline-custom-options"
+if defined _JAVA_OPTIONS set "GC_BENCH_JAVA_CONFIGURATION=java-baseline-custom-options"
 set "RUN_DIR=%ROOT%results\%BASE_RESULTS_SUBDIR%"
 if not exist "%RUN_DIR%" mkdir "%RUN_DIR%"
 if errorlevel 1 (
@@ -79,9 +93,20 @@ if errorlevel 1 (
   echo Base parameters: runs=%RUNS%, items=%ITEMS%, batches=%BATCHES%, payload_bytes=%PAYLOAD%, warmup_batches=%WARMUP_BATCHES%
   echo Large-object series: items=64, batches=10, payload_bytes=1048576
   echo Large-object Java JFR diagnostic flags only; baseline uses JVM defaults: -Xms512m -Xmx512m -XX:+UseG1GC -XX:G1HeapRegionSize=1m
+  echo Java minimum: JDK 21
+  echo GOGC=%GOGC%
+  echo GOMEMLIMIT=%GOMEMLIMIT%
+  echo GOMAXPROCS=%GOMAXPROCS%
+  echo DOTNET_GCServer=%DOTNET_GCServer%
+  echo DOTNET_GCHeapHardLimit=%DOTNET_GCHeapHardLimit%
+  echo DOTNET_GCConserveMemory=%DOTNET_GCConserveMemory%
+  echo JAVA_OPTS=%JAVA_OPTS%
+  echo JAVA_TOOL_OPTIONS=%JAVA_TOOL_OPTIONS%
+  echo _JAVA_OPTIONS=%_JAVA_OPTIONS%
+  echo Java baseline configuration ID: %GC_BENCH_JAVA_CONFIGURATION%
   echo.
   echo --- OS ---
-  ver
+  powershell -NoProfile -Command "Get-CimInstance Win32_OperatingSystem | Select-Object -ExpandProperty Caption; ver"
   echo.
   echo --- Go ---
   go version
@@ -90,13 +115,15 @@ if errorlevel 1 (
   dotnet --list-sdks
   echo.
   echo --- Java ---
+  javac -version
   java -version
+  java %JAVA_OPTS% -XX:+PrintFlagsFinal -version 2^>^&1 | findstr /I /C:"InitialHeapSize" /C:"MaxHeapSize" /C:"UseG1GC" /C:"G1HeapRegionSize" /C:"UseParallelGC" /C:"UseZGC" /C:"UseSerialGC"
   echo.
   echo --- Python ---
   python --version
   echo.
   echo --- CPU and memory ---
-  powershell -NoProfile -Command "Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty Name; 'RAM bytes: ' + (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory"
+  powershell -NoProfile -Command "Get-CimInstance Win32_Processor | Select-Object -First 1 Name,NumberOfCores,NumberOfLogicalProcessors; 'RAM bytes: ' + (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory"
 ) > "%RUN_DIR%\experiment-info.txt" 2>&1
 
  echo.
@@ -132,6 +159,10 @@ if errorlevel 1 goto :failed
 rem Stage 3: Java JFR recordings with the same baseline workload parameters.
 echo.
 echo [3/6] Recording Java JFR pauses for all five baseline scenarios...
+set "GC_BENCH_JFR_CONFIGURATION=java-jfr-diagnostic-default"
+if defined JAVA_OPTS set "GC_BENCH_JFR_CONFIGURATION=java-jfr-diagnostic-custom-options"
+if defined JAVA_TOOL_OPTIONS set "GC_BENCH_JFR_CONFIGURATION=java-jfr-diagnostic-custom-options"
+if defined _JAVA_OPTIONS set "GC_BENCH_JFR_CONFIGURATION=java-jfr-diagnostic-custom-options"
 for %%S in (transient retained graph large mixed) do (
   echo.
   echo --- Java JFR: %%S ---
@@ -144,6 +175,7 @@ echo.
 echo [4/6] Processing baseline Java JFR recordings...
 call "%ROOT%tools\process_java_jfr.bat"
 if errorlevel 1 goto :failed
+set "GC_BENCH_JFR_CONFIGURATION="
 
 echo.
 echo === Adding Java JFR analysis to scenario reports ===
@@ -166,17 +198,23 @@ if errorlevel 1 goto :failed
 
 rem Baseline Java run uses default JVM settings and no JFR, like the other platforms.
 set "SAVED_JAVA_OPTS=%JAVA_OPTS%"
+set "SAVED_JAVA_CONFIGURATION=%GC_BENCH_JAVA_CONFIGURATION%"
 set "JAVA_OPTS="
+set "GC_BENCH_JAVA_CONFIGURATION=java-large-baseline-default"
 call "%ROOT%tools\run_repeat.bat" java large %RUNS% 64 10 1048576
 if errorlevel 1 goto :failed
 set "JAVA_OPTS=%SAVED_JAVA_OPTS%"
+set "GC_BENCH_JAVA_CONFIGURATION=%SAVED_JAVA_CONFIGURATION%"
+set "SAVED_JAVA_CONFIGURATION="
 set "SAVED_JAVA_OPTS="
 
 rem A separately labeled JFR diagnostic uses fixed G1 region settings; do not
 rem include it in the uninstrumented cross-platform performance table.
 set "JAVA_OPTS=-Xms512m -Xmx512m -XX:+UseG1GC -XX:G1HeapRegionSize=1m"
+set "GC_BENCH_JFR_CONFIGURATION=java-g1-xms512m-xmx512m-region1m-jfr"
 call "%ROOT%tools\run_java_jfr.bat" large %RUNS% 64 10 1048576
 if errorlevel 1 goto :failed
+set "GC_BENCH_JFR_CONFIGURATION="
 call "%ROOT%tools\process_java_jfr.bat" large
 if errorlevel 1 goto :failed
 

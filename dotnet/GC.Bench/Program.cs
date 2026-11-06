@@ -141,20 +141,52 @@ static class Program
         if (scenario is not ("transient" or "retained" or "graph" or "large" or "mixed")) throw new ArgumentException("Unknown scenario");
 
         Retained.Clear(); _sinkNodes = null; _sinkBytes = null;
+        int retainedPerBatch = Math.Max(1, items / 10);
         int warmItems = items;
+        if (scenario is "retained" or "mixed")
+            Retained.EnsureCapacity(checked(retainedPerBatch * warmupBatches));
         for (int b = 0; b < warmupBatches; b++)
         {
-            if (scenario == "large")
+            switch (scenario)
             {
-                _sinkBytes = new byte[warmItems][];
-                for (int i = 0; i < warmItems; i++) _sinkBytes[i] = new byte[payload];
-                _sinkBytes = null;
-            }
-            else
-            {
-                _sinkNodes = MakeNodes(warmItems, payload, scenario == "graph");
-                Touch(_sinkNodes);
-                _sinkNodes = null;
+                case "retained":
+                {
+                    var batch = MakeNodes(warmItems, payload, false);
+                    for (int i = 0; i < retainedPerBatch; i++)
+                        Retained.Add(batch[(int)((long)i * warmItems / retainedPerBatch)]);
+                    _sinkNodes = batch;
+                    Touch(_sinkNodes);
+                    _sinkNodes = null;
+                    break;
+                }
+                case "mixed":
+                {
+                    var batch = MakeNodes(warmItems, payload, false);
+                    for (int i = 0; i < retainedPerBatch; i++)
+                        Retained.Add(batch[(int)((long)i * warmItems / retainedPerBatch)]);
+                    _sinkNodes = batch;
+                    Touch(_sinkNodes);
+                    _sinkBytes = new[] { new byte[Math.Max(1, checked(payload * 16))] };
+                    _checksum += _sinkBytes[0][0];
+                    _sinkNodes = null;
+                    _sinkBytes = null;
+                    break;
+                }
+                case "large":
+                    _sinkBytes = new byte[warmItems][];
+                    for (int i = 0; i < warmItems; i++)
+                    {
+                        _sinkBytes[i] = new byte[payload];
+                        if (payload > 0) _sinkBytes[i][0] = (byte)i;
+                    }
+                    if (_sinkBytes.Length > 0 && _sinkBytes[0].Length > 0) _checksum += _sinkBytes[0][0];
+                    _sinkBytes = null;
+                    break;
+                default:
+                    _sinkNodes = MakeNodes(warmItems, payload, scenario == "graph");
+                    Touch(_sinkNodes);
+                    _sinkNodes = null;
+                    break;
             }
         }
         Retained.Clear(); _sinkNodes = null; _sinkBytes = null;
@@ -162,7 +194,6 @@ static class Program
         GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
         GC.WaitForPendingFinalizers();
         GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
-        int retainedPerBatch = Math.Max(1, items / 10);
         if (scenario is "retained" or "mixed")
         {
             Retained.EnsureCapacity(checked(retainedPerBatch * batches));
@@ -252,6 +283,17 @@ static class Program
                 gc_pause_distribution = new { unit = "ms", source = "EventPipe CLR GC suspend/restart events", scope = "separate_diagnostic_process", calculation = "full pause is GCSuspendEEStart to GCRestartEEStop; fully suspended duration is also reported; GCStart supplies generation, reason, and type", cross_platform_comparable = false }
             },
             platform = "dotnet",
+            runtime_configuration_id = "default",
+            gc_configuration = new
+            {
+                server_gc_effective = GCSettings.IsServerGC,
+                workstation_gc_effective = !GCSettings.IsServerGC,
+                dotnet_gc_server = Environment.GetEnvironmentVariable("DOTNET_GCServer") ?? "unset",
+                dotnet_gc_heap_hard_limit = Environment.GetEnvironmentVariable("DOTNET_GCHeapHardLimit") ?? "unset",
+                dotnet_gc_conserve_memory = Environment.GetEnvironmentVariable("DOTNET_GCConserveMemory") ?? "unset",
+                total_available_memory_bytes = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes,
+                logical_processor_count = Environment.ProcessorCount
+            },
             session_id = Environment.GetEnvironmentVariable("GC_BENCH_SESSION_ID"),
             repetition = Environment.GetEnvironmentVariable("GC_BENCH_REPETITION"),
             run_order = Environment.GetEnvironmentVariable("GC_BENCH_RUN_ORDER"),

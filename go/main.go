@@ -167,17 +167,49 @@ func main() {
 	retainedNodes = nil
 	sinkNodes = nil
 	sinkBytes = nil
-	warmItems := *items
+	retainCount := max(1, *items/10)
+	if *scenario == "retained" || *scenario == "mixed" {
+		if *warmupBatches > int(^uint(0)>>1)/retainCount {
+			fmt.Fprintln(os.Stderr, "warm-up retained node capacity exceeds the supported size")
+			os.Exit(2)
+		}
+		retainedNodes = make([]*Node, 0, retainCount*(*warmupBatches))
+	}
 	for b := 0; b < *warmupBatches; b++ {
 		switch *scenario {
 		case "large":
-			sinkBytes = make([][]byte, warmItems)
+			sinkBytes = make([][]byte, *items)
 			for i := range sinkBytes {
 				sinkBytes[i] = make([]byte, *payload)
+				if *payload > 0 {
+					sinkBytes[i][0] = byte(i)
+				}
+			}
+			if len(sinkBytes) > 0 && len(sinkBytes[0]) > 0 {
+				checksum += uint64(sinkBytes[0][0])
 			}
 			sinkBytes = nil
+		case "retained":
+			batch := makeNodes(*items, *payload, false)
+			for i := 0; i < retainCount; i++ {
+				retainedNodes = append(retainedNodes, batch[i*len(batch)/retainCount])
+			}
+			sinkNodes = batch
+			touchNodes(sinkNodes)
+			sinkNodes = nil
+		case "mixed":
+			batch := makeNodes(*items, *payload, false)
+			for i := 0; i < retainCount; i++ {
+				retainedNodes = append(retainedNodes, batch[i*len(batch)/retainCount])
+			}
+			sinkNodes = batch
+			touchNodes(sinkNodes)
+			sinkBytes = [][]byte{make([]byte, max(1, *payload*16))}
+			checksum += uint64(sinkBytes[0][0])
+			sinkNodes = nil
+			sinkBytes = nil
 		default:
-			sinkNodes = makeNodes(warmItems, *payload, *scenario == "graph")
+			sinkNodes = makeNodes(*items, *payload, *scenario == "graph")
 			touchNodes(sinkNodes)
 			sinkNodes = nil
 		}
@@ -187,7 +219,6 @@ func main() {
 	sinkBytes = nil
 	// A forced full collection is part of the unmeasured warm-up/reset phase.
 	runtime.GC()
-	retainCount := max(1, *items/10)
 	if *batches > int(^uint(0)>>1)/retainCount {
 		fmt.Fprintln(os.Stderr, "retained node capacity exceeds the supported size")
 		os.Exit(2)
@@ -332,7 +363,15 @@ func main() {
 			"gc_cycles_delta":       map[string]any{"unit": "cycles", "source": "runtime.MemStats.NumGC", "scope": "measured_interval", "calculation": "NumGC_after - NumGC_before; complete Go GC cycles", "cross_platform_comparable": false},
 			"gc_pause_percentiles":  map[string]any{"unit": "ms", "source": "/sched/pauses/total/gc:seconds", "scope": "measured_interval", "calculation": "approximate quantiles from histogram bucket deltas", "cross_platform_comparable": false},
 		},
-		"platform": "go", "runtime_version": runtime.Version(), "goos": runtime.GOOS, "goarch": runtime.GOARCH,
+		"platform": "go", "runtime_configuration_id": "default",
+		"gc_configuration": map[string]any{
+			"GOGC":                envOrDefault("GOGC", "100 (runtime default)"),
+			"GOMEMLIMIT":          envOrDefault("GOMEMLIMIT", "unlimited (runtime default)"),
+			"GOMAXPROCS_env":      envOrDefault("GOMAXPROCS", "unset"),
+			"GOMAXPROCS_effective": runtime.GOMAXPROCS(0),
+			"available_logical_cpus": runtime.NumCPU(),
+		},
+		"runtime_version": runtime.Version(), "goos": runtime.GOOS, "goarch": runtime.GOARCH,
 		"session_id": os.Getenv("GC_BENCH_SESSION_ID"), "repetition": os.Getenv("GC_BENCH_REPETITION"),
 		"run_order":            os.Getenv("GC_BENCH_RUN_ORDER"),
 		"expected_repetitions": os.Getenv("GC_BENCH_EXPECTED_REPETITIONS"),
@@ -386,6 +425,13 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func envOrDefault(key, fallback string) string {
+	if value, ok := os.LookupEnv(key); ok && value != "" {
+		return value
+	}
+	return fallback
 }
 
 func minInt(a, b int) int {

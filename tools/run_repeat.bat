@@ -44,6 +44,13 @@ if defined RESULTS_SUBDIR set "RESULTS_DIR=%RESULTS_DIR%\%RESULTS_SUBDIR%"
 if not exist "%RESULTS_DIR%" mkdir "%RESULTS_DIR%"
 if errorlevel 1 goto :failed
 set "OUTFILE=%RESULTS_DIR%\%PLATFORM%-%SCENARIO%.jsonl"
+where python >nul 2>nul
+if errorlevel 1 (
+    echo ERROR: Python was not found in PATH; the external memory sampler requires Python.
+    goto :failed
+)
+if /I "%PLATFORM%"=="java" call :check_jdk
+if /I "%PLATFORM%"=="java" if errorlevel 1 goto :failed
 
 if /I "%GC_BENCH_SKIP_BUILD%"=="1" goto :start_runs
 
@@ -113,6 +120,24 @@ popd
 if not "%BUILD_RC%"=="0" exit /b 1
 exit /b 0
 
+:check_jdk
+where javac >nul 2>nul
+if errorlevel 1 (
+    echo ERROR: javac was not found in PATH. Install a JDK and reopen the terminal.
+    exit /b 1
+)
+for /f "tokens=2" %%V in ('javac -version 2^>^&1') do set "JDK_VERSION=%%V"
+for /f "tokens=1 delims=." %%V in ("%JDK_VERSION%") do set "JDK_MAJOR=%%V"
+if not defined JDK_MAJOR (
+    echo ERROR: Could not determine the JDK version.
+    exit /b 1
+)
+if %JDK_MAJOR% LSS 21 (
+    echo ERROR: JDK 21 or newer is required; found javac %JDK_VERSION%.
+    exit /b 1
+)
+exit /b 0
+
 :start_runs
 if /I "%GC_BENCH_APPEND_RESULTS%"=="1" goto :runs_ready
 (type nul) > "%OUTFILE%"
@@ -148,7 +173,7 @@ exit /b 1
 
 :run_go
 pushd "%ROOT%\go" || exit /b 1
-"%ROOT%\go\gcbench.exe" -scenario %SCENARIO% -warmup-batches %WARMUP_BATCHES% -batches %BATCHES% -items %ITEMS% -payload %PAYLOAD% >> "%OUTFILE%"
+python "%ROOT%\tools\run_with_memory_sampler.py" --output "%OUTFILE%" -- "%ROOT%\go\gcbench.exe" -scenario %SCENARIO% -warmup-batches %WARMUP_BATCHES% -batches %BATCHES% -items %ITEMS% -payload %PAYLOAD%
 set "RUN_RC=%ERRORLEVEL%"
 popd
 if not "%RUN_RC%"=="0" (
@@ -159,7 +184,7 @@ exit /b 0
 
 :run_dotnet
 pushd "%ROOT%\dotnet\GC.Bench" || exit /b 1
-dotnet "bin\Release\net10.0\GC.Bench.dll" --scenario %SCENARIO% --warmup-batches %WARMUP_BATCHES% --batches %BATCHES% --items %ITEMS% --payload %PAYLOAD% >> "%OUTFILE%"
+python "%ROOT%\tools\run_with_memory_sampler.py" --output "%OUTFILE%" -- dotnet "bin\Release\net10.0\GC.Bench.dll" --scenario %SCENARIO% --warmup-batches %WARMUP_BATCHES% --batches %BATCHES% --items %ITEMS% --payload %PAYLOAD%
 set "RUN_RC=%ERRORLEVEL%"
 popd
 if not "%RUN_RC%"=="0" (
@@ -170,8 +195,7 @@ exit /b 0
 
 :run_java
 pushd "%ROOT%\java" || exit /b 1
-rem JAVA_OPTS may contain JVM flags separated by spaces, e.g. -Xms512m -Xmx512m -XX:+UseG1GC.
-java %JAVA_OPTS% -cp . GcBench --scenario %SCENARIO% --warmup-batches %WARMUP_BATCHES% --batches %BATCHES% --items %ITEMS% --payload %PAYLOAD% >> "%OUTFILE%"
+python "%ROOT%\tools\run_with_memory_sampler.py" --output "%OUTFILE%" --java-options "%JAVA_OPTS%" -- java -cp . GcBench --scenario %SCENARIO% --warmup-batches %WARMUP_BATCHES% --batches %BATCHES% --items %ITEMS% --payload %PAYLOAD%
 set "RUN_RC=%ERRORLEVEL%"
 popd
 if not "%RUN_RC%"=="0" (
