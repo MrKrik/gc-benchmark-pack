@@ -61,11 +61,11 @@ DIAGNOSTIC_METRICS = [
     ("java_allocated_bytes_per_second", "Java: скорость аллокаций всех Java-потоков", "bytes/s", {
         "java": "allocated_bytes_per_second.all_java_threads_runtime_counter",
     }, "ThreadMXBean total all-threads counter; сохраняется также счетчик потока теста. Не сравнивается с Go или .NET."),
-    ("peak_working_set_bytes", "Пик Working Set процесса", "bytes", {
+    ("peak_working_set_bytes", "Пик Working Set за срок жизни процесса", "bytes", {
         "go": "memory_metrics.peak_working_set_bytes",
         "dotnet": "memory_metrics.peak_working_set_bytes",
         "java": "memory_metrics.peak_working_set_bytes",
-    }, "Пиковый resident Working Set процесса за запуск; Windows берёт пик из PSAPI, Linux — VmHWM, macOS — максимум периодических выборок."),
+    }, "Пик resident Working Set за весь срок жизни процесса, включая запуск, прогрев, измерение и очистку; Windows берёт пик из PSAPI, Linux — VmHWM, macOS — максимум периодических выборок. Это не пик только измерительного интервала."),
     ("average_sampled_working_set_bytes", "Средний выборочный Working Set", "bytes", {
         "go": "memory_metrics.average_sampled_working_set_bytes",
         "dotnet": "memory_metrics.average_sampled_working_set_bytes",

@@ -195,7 +195,7 @@ exit /b 0
 
 :run_java
 pushd "%ROOT%\java" || exit /b 1
-python "%ROOT%\tools\run_with_memory_sampler.py" --output "%OUTFILE%" --java-options "%JAVA_OPTS%" -- java -cp . GcBench --scenario %SCENARIO% --warmup-batches %WARMUP_BATCHES% --batches %BATCHES% --items %ITEMS% --payload %PAYLOAD%
+python "%ROOT%\tools\run_with_memory_sampler.py" --output "%OUTFILE%" --java-options="%JAVA_OPTS%" -- java -cp . GcBench --scenario %SCENARIO% --warmup-batches %WARMUP_BATCHES% --batches %BATCHES% --items %ITEMS% --payload %PAYLOAD%
 set "RUN_RC=%ERRORLEVEL%"
 popd
 if not "%RUN_RC%"=="0" (

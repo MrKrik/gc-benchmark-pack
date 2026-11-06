@@ -93,6 +93,8 @@ if errorlevel 1 (
   echo Base parameters: runs=%RUNS%, items=%ITEMS%, batches=%BATCHES%, payload_bytes=%PAYLOAD%, warmup_batches=%WARMUP_BATCHES%
   echo Large-object series: items=64, batches=10, payload_bytes=1048576
   echo Large-object Java JFR diagnostic flags only; baseline uses JVM defaults: -Xms512m -Xmx512m -XX:+UseG1GC -XX:G1HeapRegionSize=1m
+  echo Large-object Java baseline clears JAVA_OPTS, JAVA_TOOL_OPTIONS and _JAVA_OPTIONS.
+  echo Large-object Java G1/JFR diagnostic clears JAVA_TOOL_OPTIONS and _JAVA_OPTIONS; fixed JAVA_OPTS are applied explicitly.
   echo Java minimum: JDK 21
   echo GOGC=%GOGC%
   echo GOMEMLIMIT=%GOMEMLIMIT%
@@ -198,23 +200,69 @@ if errorlevel 1 goto :failed
 
 rem Baseline Java run uses default JVM settings and no JFR, like the other platforms.
 set "SAVED_JAVA_OPTS=%JAVA_OPTS%"
+set "SAVED_JAVA_TOOL_OPTIONS=%JAVA_TOOL_OPTIONS%"
+set "SAVED_UNDERSCORE_JAVA_OPTIONS=%_JAVA_OPTIONS%"
 set "SAVED_JAVA_CONFIGURATION=%GC_BENCH_JAVA_CONFIGURATION%"
+set "HAD_JAVA_OPTS="
+set "HAD_JAVA_TOOL_OPTIONS="
+set "HAD_UNDERSCORE_JAVA_OPTIONS="
+if defined JAVA_OPTS set "HAD_JAVA_OPTS=1"
+if defined JAVA_TOOL_OPTIONS set "HAD_JAVA_TOOL_OPTIONS=1"
+if defined _JAVA_OPTIONS set "HAD_UNDERSCORE_JAVA_OPTIONS=1"
 set "JAVA_OPTS="
+set "JAVA_TOOL_OPTIONS="
+set "_JAVA_OPTIONS="
 set "GC_BENCH_JAVA_CONFIGURATION=java-large-baseline-default"
 call "%ROOT%tools\run_repeat.bat" java large %RUNS% 64 10 1048576
-if errorlevel 1 goto :failed
-set "JAVA_OPTS=%SAVED_JAVA_OPTS%"
+set "JAVA_LARGE_BASELINE_RC=%ERRORLEVEL%"
+if defined HAD_JAVA_OPTS (set "JAVA_OPTS=%SAVED_JAVA_OPTS%") else set "JAVA_OPTS="
+if defined HAD_JAVA_TOOL_OPTIONS (set "JAVA_TOOL_OPTIONS=%SAVED_JAVA_TOOL_OPTIONS%") else set "JAVA_TOOL_OPTIONS="
+if defined HAD_UNDERSCORE_JAVA_OPTIONS (set "_JAVA_OPTIONS=%SAVED_UNDERSCORE_JAVA_OPTIONS%") else set "_JAVA_OPTIONS="
 set "GC_BENCH_JAVA_CONFIGURATION=%SAVED_JAVA_CONFIGURATION%"
-set "SAVED_JAVA_CONFIGURATION="
 set "SAVED_JAVA_OPTS="
+set "SAVED_JAVA_TOOL_OPTIONS="
+set "SAVED_UNDERSCORE_JAVA_OPTIONS="
+set "SAVED_JAVA_CONFIGURATION="
+set "HAD_JAVA_OPTS="
+set "HAD_JAVA_TOOL_OPTIONS="
+set "HAD_UNDERSCORE_JAVA_OPTIONS="
+if not "%JAVA_LARGE_BASELINE_RC%"=="0" goto :failed
+set "JAVA_LARGE_BASELINE_RC="
 
 rem A separately labeled JFR diagnostic uses fixed G1 region settings; do not
 rem include it in the uninstrumented cross-platform performance table.
+set "SAVED_JAVA_OPTS=%JAVA_OPTS%"
+set "SAVED_JAVA_TOOL_OPTIONS=%JAVA_TOOL_OPTIONS%"
+set "SAVED_UNDERSCORE_JAVA_OPTIONS=%_JAVA_OPTIONS%"
+set "SAVED_JFR_CONFIGURATION=%GC_BENCH_JFR_CONFIGURATION%"
+set "HAD_JAVA_OPTS="
+set "HAD_JAVA_TOOL_OPTIONS="
+set "HAD_UNDERSCORE_JAVA_OPTIONS="
+set "HAD_JFR_CONFIGURATION="
+if defined JAVA_OPTS set "HAD_JAVA_OPTS=1"
+if defined JAVA_TOOL_OPTIONS set "HAD_JAVA_TOOL_OPTIONS=1"
+if defined _JAVA_OPTIONS set "HAD_UNDERSCORE_JAVA_OPTIONS=1"
+if defined GC_BENCH_JFR_CONFIGURATION set "HAD_JFR_CONFIGURATION=1"
 set "JAVA_OPTS=-Xms512m -Xmx512m -XX:+UseG1GC -XX:G1HeapRegionSize=1m"
+set "JAVA_TOOL_OPTIONS="
+set "_JAVA_OPTIONS="
 set "GC_BENCH_JFR_CONFIGURATION=java-g1-xms512m-xmx512m-region1m-jfr"
 call "%ROOT%tools\run_java_jfr.bat" large %RUNS% 64 10 1048576
-if errorlevel 1 goto :failed
-set "GC_BENCH_JFR_CONFIGURATION="
+set "JAVA_LARGE_JFR_RC=%ERRORLEVEL%"
+if defined HAD_JAVA_OPTS (set "JAVA_OPTS=%SAVED_JAVA_OPTS%") else set "JAVA_OPTS="
+if defined HAD_JAVA_TOOL_OPTIONS (set "JAVA_TOOL_OPTIONS=%SAVED_JAVA_TOOL_OPTIONS%") else set "JAVA_TOOL_OPTIONS="
+if defined HAD_UNDERSCORE_JAVA_OPTIONS (set "_JAVA_OPTIONS=%SAVED_UNDERSCORE_JAVA_OPTIONS%") else set "_JAVA_OPTIONS="
+if defined HAD_JFR_CONFIGURATION (set "GC_BENCH_JFR_CONFIGURATION=%SAVED_JFR_CONFIGURATION%") else set "GC_BENCH_JFR_CONFIGURATION="
+set "SAVED_JAVA_OPTS="
+set "SAVED_JAVA_TOOL_OPTIONS="
+set "SAVED_UNDERSCORE_JAVA_OPTIONS="
+set "SAVED_JFR_CONFIGURATION="
+set "HAD_JAVA_OPTS="
+set "HAD_JAVA_TOOL_OPTIONS="
+set "HAD_UNDERSCORE_JAVA_OPTIONS="
+set "HAD_JFR_CONFIGURATION="
+if not "%JAVA_LARGE_JFR_RC%"=="0" goto :failed
+set "JAVA_LARGE_JFR_RC="
 call "%ROOT%tools\process_java_jfr.bat" large
 if errorlevel 1 goto :failed
 

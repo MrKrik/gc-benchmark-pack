@@ -201,6 +201,11 @@ def main():
     if first is None or last is None or peak == 0:
         raise RuntimeError("No valid process memory samples were collected")
 
+    capture_window = (
+        "process_lifetime_including_startup_warmup_measurement_and_cleanup"
+        if platform.system() != "Darwin"
+        else "first_sample_through_process_exit; sampled peak may miss pre_sample_startup"
+    )
     result["memory_metrics"] = {
         "peak_working_set_bytes": peak,
         "average_sampled_working_set_bytes": sum(samples) / len(samples) if samples else last,
@@ -210,6 +215,7 @@ def main():
         "sampling_interval_ms": args.interval_ms,
         "source": source,
         "scope": "benchmark_process_resident_memory",
+        "capture_window": capture_window,
         "cross_platform_comparable": platform.system() != "Darwin",
     }
     comparable_peak = platform.system() != "Darwin"
@@ -218,13 +224,15 @@ def main():
             "unit": "bytes",
             "source": source,
             "scope": "benchmark_process_resident_memory",
-            "calculation": "process peak Working Set reported by OS; sampled maximum on macOS",
+            "capture_window": capture_window,
+            "calculation": "maximum resident Working Set over the benchmark process lifetime; OS-reported peak where available, sampled maximum on macOS",
             "cross_platform_comparable": comparable_peak,
         },
         "average_sampled_working_set_bytes": {
             "unit": "bytes",
             "source": "external process Working Set samples",
             "scope": "benchmark_process_resident_memory",
+            "capture_window": "sampling_from_first_sample_through_process_exit",
             "calculation": "arithmetic mean of samples at the configured interval",
             "cross_platform_comparable": True,
         },
@@ -232,6 +240,7 @@ def main():
             "unit": "bytes",
             "source": "external process Working Set sample",
             "scope": "benchmark_process_resident_memory",
+            "capture_window": "first_sample_after_process_start",
             "calculation": "first sample after process start",
             "cross_platform_comparable": True,
         },
@@ -239,6 +248,7 @@ def main():
             "unit": "bytes",
             "source": "external process Working Set sample",
             "scope": "benchmark_process_resident_memory",
+            "capture_window": "last_sample_before_process_exit",
             "calculation": "last sample before process exit",
             "cross_platform_comparable": True,
         },

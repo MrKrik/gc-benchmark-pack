@@ -28,6 +28,8 @@ var measurementActive = false;
 var measurementStartCount = 0;
 var measurementEndCount = 0;
 var gcAssociationFailures = 0;
+var duplicateGcStartEvents = 0;
+var conflictingGcStartEvents = 0;
 var pendingSuspend = new Dictionary<int, (double Timestamp, string Reason, int Count)>();
 var pendingPauseStart = new Dictionary<int, (double Timestamp, double SuspendComplete, string Reason, int ExpectedGcCount)>();
 var pendingRestartStart = new Dictionary<int, double>();
@@ -37,8 +39,20 @@ using var source = new EventPipeEventSource(input);
 var parser = new ClrTraceEventParser(source);
 parser.GCStart += data =>
 {
-    gcByCount[(data.ProcessID, data.Count)] =
-        (data.Depth, data.Reason.ToString(), data.Type.ToString(), data.Count, data.TimeStampRelativeMSec);
+    var gc = (
+        Generation: data.Depth,
+        Reason: data.Reason.ToString(),
+        Type: data.Type.ToString(),
+        Count: data.Count,
+        Timestamp: data.TimeStampRelativeMSec);
+    var key = (data.ProcessID, data.Count);
+    if (gcByCount.TryGetValue(key, out var existing))
+    {
+        duplicateGcStartEvents++;
+        if (existing.Generation != gc.Generation || existing.Reason != gc.Reason || existing.Type != gc.Type)
+            conflictingGcStartEvents++;
+    }
+    gcByCount[key] = gc;
     if (!measurementActive) return;
     writer.WriteLine(JsonSerializer.Serialize(new
     {
@@ -124,10 +138,12 @@ parser.GCRestartEEStop += data =>
         resume_ms = Math.Max(0, data.TimeStampRelativeMSec - restartStart),
         process_id = data.ProcessID,
         suspend_reason = pause.Reason,
+        suspend_gc_count = pause.ExpectedGcCount,
         generation = gc.Generation,
         gc_reason = gc.Reason,
         gc_type = gc.Type,
-        gc_count = gc.Count
+        gc_count = gc.Count,
+        gc_start_timestamp_ms = gc.Timestamp
     }));
     pauseCount++;
 };
@@ -158,7 +174,10 @@ Console.WriteLine(JsonSerializer.Serialize(new
     incompleteIntervals,
     unmatchedResumeCount,
     gcEventAssociationFailures = gcAssociationFailures,
+    duplicateGcStartEvents,
+    conflictingGcStartEvents,
     lostEvents = source.EventsLost
 }));
 return source.EventsLost == 0 && incompleteIntervals == 0 && unmatchedResumeCount == 0 &&
-    gcAssociationFailures == 0 && measurementStartCount == 1 && measurementEndCount == 1 ? 0 : 1;
+    gcAssociationFailures == 0 && conflictingGcStartEvents == 0 &&
+    measurementStartCount == 1 && measurementEndCount == 1 ? 0 : 1;

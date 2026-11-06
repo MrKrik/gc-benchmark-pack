@@ -55,9 +55,9 @@ def main():
         status = json.loads(status_file.read_text(encoding="utf-8-sig"))
         for field in (
             "lostEvents", "incompleteIntervals", "unmatchedResumeCount",
-            "gcEventAssociationFailures",
+            "gcEventAssociationFailures", "conflictingGcStartEvents",
         ):
-            if status.get(field) != 0:
+            if status.get(field, 0) != 0:
                 raise SystemExit(f"{event_file.name}: {field}={status.get(field)}; diagnostic trace is incomplete")
         if status.get("measurementStartEvents") != 1 or status.get("measurementEndEvents") != 1:
             raise SystemExit(f"{event_file.name}: measurement interval markers are missing or duplicated")
@@ -106,6 +106,8 @@ def main():
             "collections_by_reason": json.dumps(gc_reasons, sort_keys=True),
             "eventpipe_lost_events": status["lostEvents"],
             "unmatched_pause_intervals": status["incompleteIntervals"] + status["unmatchedResumeCount"],
+            "duplicate_gc_start_events": status.get("duplicateGcStartEvents", 0),
+            "conflicting_gc_start_events": status.get("conflictingGcStartEvents", 0),
         })
 
     write_csv(
@@ -113,7 +115,8 @@ def main():
         pause_rows,
         ["run", "event_name", "start_timestamp_ms", "end_timestamp_ms", "duration_ms",
          "suspension_request_ms", "fully_suspended_ms", "resume_ms", "process_id",
-         "suspend_reason", "generation", "gc_reason", "gc_type", "gc_count"],
+         "suspend_reason", "suspend_gc_count", "generation", "gc_reason", "gc_type",
+         "gc_count", "gc_start_timestamp_ms"],
     )
     write_csv(
         args.directory / "gc-start-events.csv",
